@@ -5,7 +5,7 @@ class MCRoughCfg(LeggedRobotCfg):
     """HIMLoco baseline configuration for the MC wheeled quadruped.
 
     The MC robot has 16 actuated DOFs: ABAD/HIP/KNEE/FOOT(wheel) for each
-    of four legs.  The policy structure and observation history intentionally
+    of four legs. The policy structure and observation history intentionally
     follow the Go2W HIMLoco baseline so that later silent-locomotion experiments
     have a clean reference point.
     """
@@ -41,7 +41,7 @@ class MCRoughCfg(LeggedRobotCfg):
 
     class init_state(LeggedRobotCfg.init_state):
         # Provisional nominal pose chosen to match the existing Go2W baseline
-        # while staying well inside the MC URDF joint limits.  Replace these
+        # while staying well inside the MC URDF joint limits. Replace these
         # values with measured/official MC stand angles if they become available.
         pos = [0.0, 0.0, 0.45]
         default_joint_angles = {
@@ -95,13 +95,16 @@ class MCRoughCfg(LeggedRobotCfg):
         # DOFs interpreted as wheels by the shared controller.
         wheel_name = ["FOOT_JOINT"]
         # MC naming: HIP_LINK/KNEE_LINK correspond to the main upper/lower leg
-        # links.  Keep the ABAD links available for normal articulation.
+        # links. Keep the ABAD links available for normal articulation.
         penalize_contacts_on = ["HIP_LINK", "KNEE_LINK", "BASE_LINK"]
         terminate_after_contacts_on = ["BASE_LINK"]
         priviledge_contacts_on = ["HIP_LINK", "KNEE_LINK", "BASE_LINK"]
         self_collisions = 1
         replace_cylinder_with_capsule = False
-        flip_visual_attachments = True
+        # MC meshes are exported by SolidWorks already aligned to the URDF frame.
+        # Enabling the generic y-up -> z-up visual flip makes the MC body/wheels
+        # appear rotated even though the physical collision frames are correct.
+        flip_visual_attachments = False
 
     class rewards(LeggedRobotCfg.rewards):
         class scales:
@@ -144,3 +147,13 @@ class MCRoughCfgPPO(LeggedRobotCfgPPO):
         load_run = -1
         checkpoint = -1
         resume_path = None
+
+        # Optional Weights & Biases tracking. TensorBoard logging remains enabled.
+        # Set wandb_entity to your username/team if desired; None uses the account
+        # selected by `wandb login`.
+        wandb_enabled = True
+        wandb_project = "MC-HIMLoco"
+        wandb_entity = None
+        wandb_group = "mc-baseline"
+        wandb_tags = ["MC", "HIMLoco", "wheel-legged", "baseline"]
+        wandb_mode = "online"  # online | offline | disabled
