@@ -8,17 +8,42 @@ from .mc_config import MCRoughCfg
 class MC(LeggedRobot):
     cfg: MCRoughCfg
 
-    def compute_observations(self):
-        """MC observation.
+    def _init_buffers(self):
+        super()._init_buffers()
 
-        Wheel absolute rotation is not useful for policy input, but the simulator
-        state must never be modified in-place. Use temporary tensors instead.
-        """
-        dof_pos_obs = self.dof_pos.clone()
+        # Identify wheel DOFs by joint name rather than relying on fixed indices.
+        # This keeps the MC implementation robust to URDF reordering.
+        wheel_ids = [i for i, n in enumerate(self.dof_names)
+                     if "FOOT_JOINT" in n]
+        self.wheel_indices = torch.tensor(
+            wheel_ids, dtype=torch.long, device=self.device)
+
+        self.abad_indices = torch.tensor(
+            [i for i, n in enumerate(self.dof_names) if "ABAD" in n],
+            dtype=torch.long, device=self.device)
+        self.hip_indices = torch.tensor(
+            [i for i, n in enumerate(self.dof_names) if "HIP" in n],
+            dtype=torch.long, device=self.device)
+        self.knee_indices = torch.tensor(
+            [i for i, n in enumerate(self.dof_names) if "KNEE" in n],
+            dtype=torch.long, device=self.device)
+
+    def _wheel_masked_dof_pos(self):
+        dof_pos = self.dof_pos.clone()
+        dof_pos[:, self.wheel_indices] = 0.0
+        return dof_pos
+
+    def _wheel_masked_dof_vel(self):
+        dof_vel = self.dof_vel.clone()
+        dof_vel[:, self.wheel_indices] = 0.0
+        return dof_vel
+
+    def compute_observations(self):
+        """Build policy observations without modifying Isaac Gym state."""
+        dof_pos_obs = self._wheel_masked_dof_pos()
         dof_err = dof_pos_obs - self.default_dof_pos
 
         dof_err[:, self.wheel_indices] = 0.0
-        dof_pos_obs[:, self.wheel_indices] = 0.0
 
         current_obs = torch.cat((
             self.base_ang_vel * self.obs_scales.ang_vel,
@@ -47,3 +72,20 @@ class MC(LeggedRobot):
                                   self.obs_buf[:, :-self.num_one_step_obs]), dim=-1)
         self.privileged_obs_buf = torch.cat((current_obs[:, :self.num_one_step_privileged_obs],
                                              self.privileged_obs_buf[:, :-self.num_one_step_privileged_obs]), dim=-1)
+
+    def _reward_dof_vel(self):
+        """Penalize leg velocity but ignore wheel rolling velocity."""
+        dof_vel = self._wheel_masked_dof_vel()
+        return torch.sum(torch.square(dof_vel), dim=1)
+
+    def _reward_hip_default(self):
+        """MC hip reward: only the three leg joints are posture joints.
+
+        FOOT_JOINT is a wheel rotational DOF and ABAD is lateral articulation,
+        therefore neither should be included in this regularizer.
+        """
+        hip_err = torch.sum(
+            (self.dof_pos[:, self.hip_indices] -
+             self.default_dof_pos[:, self.hip_indices]) ** 2,
+            dim=1)
+        return hip_err
