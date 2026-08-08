@@ -1,4 +1,7 @@
+import torch
+
 from legged_gym.envs.base.legged_robot import LeggedRobot
+from legged_gym.utils.math import get_scale_shift
 from .mc_config import MCRoughCfg
 
 
@@ -9,7 +12,7 @@ class MC(LeggedRobot):
         """MC observation.
 
         Wheel absolute rotation is not useful for policy input, but the simulator
-        state must never be modified in-place. Use a temporary tensor instead.
+        state must never be modified in-place. Use temporary tensors instead.
         """
         dof_pos_obs = self.dof_pos.clone()
         dof_err = dof_pos_obs - self.default_dof_pos
