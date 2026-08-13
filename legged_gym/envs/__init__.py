@@ -9,6 +9,8 @@ from .mc.mc_robot import MC
 from legged_gym.envs.mc.quiet_mc_config import QuietMCCfg, QuietMCCfgPPO
 from .mc.quiet_mc_robot import QuietMC
 from .mc.quiet_mc_v2_robot import QuietMCV2
+from .mc.mc_100hz_config import MC100HzCfg, MC100HzCfgPPO
+from .mc.quiet_mc_100hz_config import QuietMC100HzCfg, QuietMC100HzCfgPPO
 
 import os
 
@@ -18,3 +20,10 @@ task_registry.register("go2w", Go2w, GO2WRoughCfg(), GO2WRoughCfgPPO())
 task_registry.register("mc", MC, MCRoughCfg(), MCRoughCfgPPO())
 task_registry.register("quiet_mc", QuietMC, QuietMCCfg(), QuietMCCfgPPO())
 task_registry.register("quiet_mc_v2", QuietMCV2, QuietMCCfg(), QuietMCCfgPPO())
+task_registry.register("mc_100hz", MC, MC100HzCfg(), MC100HzCfgPPO())
+task_registry.register(
+    "quiet_mc_100hz_v2",
+    QuietMCV2,
+    QuietMC100HzCfg(),
+    QuietMC100HzCfgPPO(),
+)
