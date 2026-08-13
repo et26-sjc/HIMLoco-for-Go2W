@@ -11,6 +11,14 @@ from .mc.quiet_mc_robot import QuietMC
 from .mc.quiet_mc_v2_robot import QuietMCV2
 from .mc.mc_100hz_config import MC100HzCfg, MC100HzCfgPPO
 from .mc.quiet_mc_100hz_config import QuietMC100HzCfg, QuietMC100HzCfgPPO
+from .mc.mc_buffered_100hz_robot import MCBuffered100Hz
+from .mc.mc_buffered_100hz_config import MCBuffered100HzCfg, MCBuffered100HzCfgPPO
+from .mc.quiet_mc_buffered_100hz_robot import QuietMCBuffered100HzV2
+from .mc.quiet_mc_buffered_100hz_config import (
+    QuietMCBuffered100HzCfg,
+    QuietMCBuffered100HzCfgPPO,
+    QuietMCBuffered100HzZeroShotCfgPPO,
+)
 
 import os
 
@@ -26,4 +34,22 @@ task_registry.register(
     QuietMCV2,
     QuietMC100HzCfg(),
     QuietMC100HzCfgPPO(),
+)
+task_registry.register(
+    "mc_100hz_buffer",
+    MCBuffered100Hz,
+    MCBuffered100HzCfg(),
+    MCBuffered100HzCfgPPO(),
+)
+task_registry.register(
+    "quiet_mc_100hz_buffer_zeroshot_v2",
+    QuietMCBuffered100HzV2,
+    QuietMCBuffered100HzCfg(),
+    QuietMCBuffered100HzZeroShotCfgPPO(),
+)
+task_registry.register(
+    "quiet_mc_100hz_buffer_v2",
+    QuietMCBuffered100HzV2,
+    QuietMCBuffered100HzCfg(),
+    QuietMCBuffered100HzCfgPPO(),
 )
