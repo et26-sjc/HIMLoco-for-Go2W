@@ -19,6 +19,12 @@ from .mc.quiet_mc_buffered_100hz_config import (
     QuietMCBuffered100HzCfgPPO,
     QuietMCBuffered100HzZeroShotCfgPPO,
 )
+from .mc.quiet_mc_buffered_100hz_variants_config import (
+    QuietMCBuffered100HzMildCfg,
+    QuietMCBuffered100HzMildZeroShotCfgPPO,
+    QuietMCBuffered100HzPrecontactCfg,
+    QuietMCBuffered100HzPrecontactZeroShotCfgPPO,
+)
 
 import os
 
@@ -52,4 +58,16 @@ task_registry.register(
     QuietMCBuffered100HzV2,
     QuietMCBuffered100HzCfg(),
     QuietMCBuffered100HzCfgPPO(),
+)
+task_registry.register(
+    "quiet_mc_100hz_buffer_mild_zeroshot_v2",
+    QuietMCBuffered100HzV2,
+    QuietMCBuffered100HzMildCfg(),
+    QuietMCBuffered100HzMildZeroShotCfgPPO(),
+)
+task_registry.register(
+    "quiet_mc_100hz_buffer_precontact_zeroshot_v2",
+    QuietMCBuffered100HzV2,
+    QuietMCBuffered100HzPrecontactCfg(),
+    QuietMCBuffered100HzPrecontactZeroShotCfgPPO(),
 )
