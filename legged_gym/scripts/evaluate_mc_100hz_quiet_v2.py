@@ -222,4 +222,8 @@ def evaluate(args, options):
 
 
 if __name__ == "__main__":
-    evaluate(get_args(), _extract_custom_args())
+    # Strip custom evaluation flags before the Isaac Gym/legged-gym parser
+    # processes the remaining standard arguments.
+    options = _extract_custom_args()
+    args = get_args()
+    evaluate(args, options)
