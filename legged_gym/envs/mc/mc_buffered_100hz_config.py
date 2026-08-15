@@ -1,14 +1,18 @@
-"""100 Hz MC experiment with minimal contact-triggered leg buffering."""
+"""100 Hz MC experiment with minimal contact-triggered leg buffering.
 
-from .mc_100hz_config import MC100HzCfg, MC100HzCfgPPO
+This experiment is intentionally identical to the successful MC100HzMinimal
+training setup except for the low-level contact-aware HIP/KNEE gain schedule.
+"""
+
+from .mc_100hz_minimal_config import MC100HzMinimalCfg, MC100HzMinimalCfgPPO
 
 
-class MCBuffered100HzCfg(MC100HzCfg):
+class MCBuffered100HzCfg(MC100HzMinimalCfg):
     class buffer_control:
         enabled = True
-        # Flat baseline positive loading-rate p99 is about 14 kN/s; stair tails
-        # are much larger.  Start above the flat tail to avoid softening during
-        # ordinary rolling.
+        # Flat positive loading-rate p99 is about 14-15 kN/s, while the
+        # downstairs tail is much larger (~31 kN/s for B1 model_10000).
+        # Start above normal rolling so the controller mainly reacts to impacts.
         loading_rate_threshold_nps = 20000.0
         contact_on_threshold_n = 5.0
         # 30 ms = 6 physics steps at 200 Hz.
@@ -18,11 +22,12 @@ class MCBuffered100HzCfg(MC100HzCfg):
         hip_knee_kd_scale = 1.50
 
 
-class MCBuffered100HzCfgPPO(MC100HzCfgPPO):
-    class runner(MC100HzCfgPPO.runner):
-        experiment_name = "MC100HzBuffer"
+class MCBuffered100HzCfgPPO(MC100HzMinimalCfgPPO):
+    class runner(MC100HzMinimalCfgPPO.runner):
+        experiment_name = "MC100HzBufferMinimal"
         run_name = "contact_buffer"
         save_interval = 500
+        max_iterations = 20000
         resume = False
         load_run = -1
         checkpoint = -1
@@ -37,7 +42,9 @@ class MCBuffered100HzCfgPPO(MC100HzCfgPPO):
             "HIMLoco",
             "wheel-legged",
             "100Hz",
+            "history-6",
             "contact-buffer",
             "gain-scheduling",
+            "minimal-frequency-base",
         ]
         wandb_mode = "online"
