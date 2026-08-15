@@ -30,4 +30,9 @@ task_registry.train_cfgs["quiet_mc_100hz_v2"] = task_registry.train_cfgs[
 
 
 if __name__ == "__main__":
-    evaluate(get_args(), _extract_custom_args())
+    # Custom evaluation flags (e.g. --eval_scenario) are not known to the
+    # Isaac Gym argparse helper.  Remove them from sys.argv first, then parse
+    # the standard legged-gym arguments.
+    options = _extract_custom_args()
+    args = get_args()
+    evaluate(args, options)
