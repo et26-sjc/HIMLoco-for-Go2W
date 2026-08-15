@@ -1,16 +1,16 @@
 """Contact-aware gain scheduling for the 100 Hz MC experiment.
 
 This is intentionally a minimal buffering controller, not admittance control.
-The policy/action space and wheel velocity control remain unchanged.  When a
-wheel experiences a new contact or a sharp rise in total contact-force
-magnitude, HIP/KNEE gains are softened for a short hold window:
+The policy/action space and wheel velocity control remain unchanged.  HIP/KNEE
+gains can be softened for a short hold window when one or more configured
+impact cues fire:
 
-    Kp -> kp_scale * Kp
-    Kd -> kd_scale * Kd
+* new wheel contact;
+* sharp rise in total wheel contact-force magnitude;
+* optional pre-contact downward wheel motion while unloaded.
 
-The impact detector runs at the 200 Hz physics rate.  The default loading-rate
-threshold is chosen above the observed flat-ground p99 (~14 kN/s) and below the
-large stair-impact tail, so normal rolling should rarely trigger the buffer.
+The last cue is useful for downstairs motion because it can soften the leg
+*before* the first force spike rather than only reacting after impact.
 """
 
 from isaacgym import gymtorch
@@ -20,20 +20,27 @@ from .mc_robot import MC
 
 
 class MCBuffered100Hz(MC):
-    """MC with a short contact-triggered compliant HIP/KNEE response."""
+    """MC with a short contact/pre-contact compliant HIP/KNEE response."""
 
     def _init_buffers(self):
         super()._init_buffers()
         cfg = self.cfg.buffer_control
         self.buffer_contact_on = float(cfg.contact_on_threshold_n)
-        self.buffer_loading_rate_threshold = float(
-            cfg.loading_rate_threshold_nps
-        )
+        self.buffer_loading_rate_threshold = float(cfg.loading_rate_threshold_nps)
         self.buffer_hold_steps = max(
             1, int(round(float(cfg.hold_time_s) / float(self.sim_params.dt)))
         )
         self.buffer_kp_scale = float(cfg.hip_knee_kp_scale)
         self.buffer_kd_scale = float(cfg.hip_knee_kd_scale)
+        self.buffer_trigger_on_new_contact = bool(
+            getattr(cfg, "trigger_on_new_contact", True)
+        )
+        self.buffer_precontact_enabled = bool(
+            getattr(cfg, "precontact_enabled", False)
+        )
+        self.buffer_precontact_downward_speed = float(
+            getattr(cfg, "precontact_downward_speed_threshold_mps", 0.25)
+        )
 
         force_norm = torch.norm(
             self.contact_forces[:, self.feet_indices, :], dim=-1
@@ -47,9 +54,10 @@ class MCBuffered100Hz(MC):
         )
         self.buffer_last_loading_rate = torch.zeros_like(force_norm)
         self.buffer_last_impact = torch.zeros_like(force_norm, dtype=torch.bool)
+        self.buffer_last_precontact = torch.zeros_like(force_norm, dtype=torch.bool)
 
     def _update_buffer_state(self):
-        """Update impact detector from the most recently refreshed contact force."""
+        """Update buffer trigger state from the latest physics-rate signals."""
         force_norm = torch.norm(
             self.contact_forces[:, self.feet_indices, :], dim=-1
         )
@@ -57,12 +65,29 @@ class MCBuffered100Hz(MC):
             force_norm - self.buffer_prev_force_norm
         ) / float(self.sim_params.dt)
 
-        new_contact = (
-            (self.buffer_prev_force_norm < self.buffer_contact_on)
-            & (force_norm >= self.buffer_contact_on)
-        )
+        if self.buffer_trigger_on_new_contact:
+            new_contact = (
+                (self.buffer_prev_force_norm < self.buffer_contact_on)
+                & (force_norm >= self.buffer_contact_on)
+            )
+        else:
+            new_contact = torch.zeros_like(force_norm, dtype=torch.bool)
+
         sharp_loading = loading_rate >= self.buffer_loading_rate_threshold
-        impact = new_contact | sharp_loading
+
+        precontact = torch.zeros_like(force_norm, dtype=torch.bool)
+        if self.buffer_precontact_enabled:
+            states = self.rigid_body_states.view(
+                self.num_envs, self.num_bodies, 13
+            )
+            # Rigid-body state layout: pos[0:3], quat[3:7], lin_vel[7:10], ...
+            wheel_world_vz = states[:, self.feet_indices, 9]
+            precontact = (
+                (force_norm < self.buffer_contact_on)
+                & (wheel_world_vz <= -self.buffer_precontact_downward_speed)
+            )
+
+        impact = new_contact | sharp_loading | precontact
 
         self.buffer_timer = torch.clamp(self.buffer_timer - 1, min=0)
         self.buffer_timer = torch.where(
@@ -73,6 +98,7 @@ class MCBuffered100Hz(MC):
         self.buffer_prev_force_norm.copy_(force_norm)
         self.buffer_last_loading_rate.copy_(loading_rate)
         self.buffer_last_impact.copy_(impact)
+        self.buffer_last_precontact.copy_(precontact)
 
     def _gain_scales(self):
         """Return per-env/per-DOF Kp and Kd multipliers."""
@@ -120,16 +146,8 @@ class MCBuffered100Hz(MC):
 
         control_type = self.cfg.control.control_type
         if control_type == "P":
-            p = (
-                self.p_gains.unsqueeze(0)
-                * self.Kp_factors
-                * kp_scale
-            )
-            d = (
-                self.d_gains.unsqueeze(0)
-                * self.Kd_factors
-                * kd_scale
-            )
+            p = self.p_gains.unsqueeze(0) * self.Kp_factors * kp_scale
+            d = self.d_gains.unsqueeze(0) * self.Kd_factors * kd_scale
             torques = p * (actions_scaled + dof_err) + d * (
                 vel_ref - self.dof_vel
             )
@@ -145,7 +163,7 @@ class MCBuffered100Hz(MC):
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
     def step(self, actions):
-        """Base MC step with contact forces refreshed at every physics substep."""
+        """Base MC step with contact/body state refreshed every physics substep."""
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
 
@@ -176,8 +194,9 @@ class MCBuffered100Hz(MC):
             if self.device == "cpu":
                 self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
-            # Needed so the next 5 ms control update sees the latest wheel load.
             self.gym.refresh_net_contact_force_tensor(self.sim)
+            # Required by the optional pre-contact wheel-velocity trigger.
+            self.gym.refresh_rigid_body_state_tensor(self.sim)
 
         termination_ids, termination_privileged_obs = self.post_physics_step()
 
@@ -204,6 +223,7 @@ class MCBuffered100Hz(MC):
         self.buffer_timer[env_ids] = 0
         self.buffer_last_loading_rate[env_ids] = 0.0
         self.buffer_last_impact[env_ids] = False
+        self.buffer_last_precontact[env_ids] = False
         force_norm = torch.norm(
             self.contact_forces[:, self.feet_indices, :], dim=-1
         )
