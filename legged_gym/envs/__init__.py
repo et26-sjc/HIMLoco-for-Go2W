@@ -12,6 +12,10 @@ from .mc.quiet_mc_v2_robot import QuietMCV2
 from .mc.mc_100hz_config import MC100HzCfg, MC100HzCfgPPO
 from .mc.mc_100hz_minimal_config import MC100HzMinimalCfg, MC100HzMinimalCfgPPO
 from .mc.quiet_mc_100hz_config import QuietMC100HzCfg, QuietMC100HzCfgPPO
+from .mc.quiet_mc_100hz_minimal_config import (
+    QuietMC100HzMinimalCfg,
+    QuietMC100HzMinimalCfgPPO,
+)
 
 import os
 
@@ -33,4 +37,10 @@ task_registry.register(
     QuietMCV2,
     QuietMC100HzCfg(),
     QuietMC100HzCfgPPO(),
+)
+task_registry.register(
+    "quiet_mc_100hz_minimal_v2",
+    QuietMCV2,
+    QuietMC100HzMinimalCfg(),
+    QuietMC100HzMinimalCfgPPO(),
 )
