@@ -20,12 +20,17 @@ from .mc.mc_admittance_100hz_robot import MCAdmittance100Hz
 from .mc.mc_admittance_100hz_config import (
     MCAdmittance100HzCfg,
     MCAdmittance100HzCfgPPO,
+    MCAdmittanceGated100HzCfg,
+    MCAdmittanceGated100HzCfgPPO,
 )
 from .mc.quiet_mc_admittance_100hz_robot import QuietMCAdmittance100HzV2
 from .mc.quiet_mc_admittance_100hz_config import (
     QuietMCAdmittance100HzCfg,
     QuietMCAdmittance100HzCfgPPO,
     QuietMCAdmittance100HzZeroShotCfgPPO,
+    QuietMCAdmittanceGated100HzCfg,
+    QuietMCAdmittanceGated100HzCfgPPO,
+    QuietMCAdmittanceGated100HzZeroShotCfgPPO,
 )
 
 import os
@@ -72,4 +77,22 @@ task_registry.register(
     QuietMCAdmittance100HzV2,
     QuietMCAdmittance100HzCfg(),
     QuietMCAdmittance100HzCfgPPO(),
+)
+task_registry.register(
+    "mc_100hz_admittance_gated",
+    MCAdmittance100Hz,
+    MCAdmittanceGated100HzCfg(),
+    MCAdmittanceGated100HzCfgPPO(),
+)
+task_registry.register(
+    "quiet_mc_100hz_admittance_gated_zeroshot_v2",
+    QuietMCAdmittance100HzV2,
+    QuietMCAdmittanceGated100HzCfg(),
+    QuietMCAdmittanceGated100HzZeroShotCfgPPO(),
+)
+task_registry.register(
+    "quiet_mc_100hz_admittance_gated_v2",
+    QuietMCAdmittance100HzV2,
+    QuietMCAdmittanceGated100HzCfg(),
+    QuietMCAdmittanceGated100HzCfgPPO(),
 )
