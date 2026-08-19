@@ -3,14 +3,15 @@
 The HIM policy is unchanged.  At every 200 Hz physics substep, the controller:
 
 1. projects each wheel contact force onto the current hip-to-wheel leg axis;
-2. removes a slowly varying support-force baseline and a small deadband;
-3. integrates a virtual mass-spring-damper to obtain extra leg compression;
-4. maps that Cartesian compression to HIP/KNEE offsets with a damped Jacobian;
-5. executes the modified target with the original fixed PD gains.
+2. optionally detects a fast axial loading event and opens a short admittance gate;
+3. removes a slowly varying support-force baseline and a small deadband;
+4. integrates a virtual mass-spring-damper to obtain extra leg compression;
+5. maps that Cartesian compression to HIP/KNEE offsets with a damped Jacobian;
+6. executes the modified target with the original fixed PD gains.
 
-Flat rolling therefore stays close to the original policy because steady support
-force is absorbed by the force baseline, while transient stair impacts create a
-short-lived compliant displacement.
+The original A0 controller keeps the gate disabled.  A0.1 can enable the gate so
+normal flat rolling does not continuously start new admittance events, while
+large stair impacts still generate a short-lived compliant displacement.
 """
 
 from isaacgym import gymtorch
@@ -52,6 +53,21 @@ class MCAdmittance100Hz(MC):
         self.admittance_l2 = float(cfg.lower_leg_length_m)
         self.admittance_jacobian_damping = float(cfg.jacobian_damping)
 
+        # Optional A0.1 impact gate.  getattr keeps the original A0 config
+        # backward compatible and behavior-identical when these fields are absent.
+        self.admittance_use_loading_rate_gate = bool(
+            getattr(cfg, "use_loading_rate_gate", False)
+        )
+        self.admittance_loading_rate_gate = float(
+            getattr(cfg, "loading_rate_gate_nps", 0.0)
+        )
+        self.admittance_gate_hold_time = float(
+            getattr(cfg, "gate_hold_time_s", 0.0)
+        )
+        self.admittance_freeze_bias_during_gate = bool(
+            getattr(cfg, "freeze_force_bias_during_gate", False)
+        )
+
         self.admittance_hip_body_indices = torch.tensor(
             [
                 self.gym.find_actor_rigid_body_handle(
@@ -79,6 +95,12 @@ class MCAdmittance100Hz(MC):
         self.admittance_force_bias = torch.zeros_like(self.admittance_delta_l)
         self.admittance_axial_force = torch.zeros_like(self.admittance_delta_l)
         self.admittance_force_input = torch.zeros_like(self.admittance_delta_l)
+        self.admittance_loading_rate = torch.zeros_like(self.admittance_delta_l)
+        self.admittance_prev_axial_force = torch.zeros_like(self.admittance_delta_l)
+        self.admittance_gate_timer = torch.zeros_like(self.admittance_delta_l)
+        self.admittance_gate_active = torch.zeros(
+            *shape, dtype=torch.bool, device=self.device
+        )
         self.admittance_joint_offset = torch.zeros(
             self.num_envs,
             int(self.feet_indices.numel()),
@@ -110,24 +132,69 @@ class MCAdmittance100Hz(MC):
             self.admittance_delta_l_dot.zero_()
             self.admittance_axial_force.zero_()
             self.admittance_force_input.zero_()
+            self.admittance_loading_rate.zero_()
+            self.admittance_gate_active.zero_()
             return
 
         dt = float(self.sim_params.dt)
         axial_force = self._axial_contact_force()
 
-        # Use the *previous* low-pass baseline for the transient-force estimate,
-        # then update the baseline.  This preserves the fast edge of an impact.
-        transient_force = torch.clamp(
+        # Positive axial force slew is a useful stair-impact discriminator.  The
+        # gate only controls whether *new force* drives the admittance; the
+        # virtual spring/damper keeps evolving continuously so it can return to
+        # zero smoothly after the event.
+        loading_rate = torch.clamp(
+            (axial_force - self.admittance_prev_axial_force) / dt,
+            min=0.0,
+        )
+        self.admittance_prev_axial_force.copy_(axial_force)
+        self.admittance_loading_rate.copy_(loading_rate)
+
+        if self.admittance_use_loading_rate_gate:
+            triggered = loading_rate >= self.admittance_loading_rate_gate
+            self.admittance_gate_timer = torch.where(
+                triggered,
+                torch.full_like(
+                    self.admittance_gate_timer,
+                    self.admittance_gate_hold_time,
+                ),
+                torch.clamp(self.admittance_gate_timer - dt, min=0.0),
+            )
+            gate_active = self.admittance_gate_timer > 0.0
+        else:
+            gate_active = torch.ones_like(self.admittance_gate_active)
+        self.admittance_gate_active.copy_(gate_active)
+
+        # Use the *previous* low-pass baseline for the transient-force estimate.
+        raw_transient_force = torch.clamp(
             axial_force
             - self.admittance_force_bias
             - self.admittance_force_deadband,
             min=0.0,
             max=self.admittance_max_force_input,
         )
-        alpha = dt / max(dt, self.admittance_force_bias_tau + dt)
-        self.admittance_force_bias += alpha * (
-            axial_force - self.admittance_force_bias
+        transient_force = torch.where(
+            gate_active,
+            raw_transient_force,
+            torch.zeros_like(raw_transient_force),
         )
+
+        # Track steady support force while inactive.  For gated A0.1 we can
+        # freeze the baseline during an impact window, preventing the fast impact
+        # itself from being absorbed into the support-force estimate.
+        alpha = dt / max(dt, self.admittance_force_bias_tau + dt)
+        bias_update = alpha * (axial_force - self.admittance_force_bias)
+        if (
+            self.admittance_use_loading_rate_gate
+            and self.admittance_freeze_bias_during_gate
+        ):
+            self.admittance_force_bias += torch.where(
+                gate_active,
+                torch.zeros_like(bias_update),
+                bias_update,
+            )
+        else:
+            self.admittance_force_bias += bias_update
 
         delta_l_ddot = (
             transient_force
@@ -323,4 +390,8 @@ class MCAdmittance100Hz(MC):
         self.admittance_force_bias[env_ids] = 0.0
         self.admittance_axial_force[env_ids] = 0.0
         self.admittance_force_input[env_ids] = 0.0
+        self.admittance_loading_rate[env_ids] = 0.0
+        self.admittance_prev_axial_force[env_ids] = 0.0
+        self.admittance_gate_timer[env_ids] = 0.0
+        self.admittance_gate_active[env_ids] = False
         self.admittance_joint_offset[env_ids] = 0.0
