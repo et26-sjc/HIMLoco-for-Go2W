@@ -1,4 +1,9 @@
-"""Evaluate MC-HIM-100Hz checkpoints with the same quiet protocol v2."""
+"""Evaluate MC-HIM-100Hz checkpoints with the same quiet protocol v2.
+
+The evaluator also records optional controller diagnostics when the environment
+exposes them.  This keeps fixed-PD and admittance runs on exactly the same
+terrain, command and quiet-metric protocol.
+"""
 
 import os
 
@@ -70,7 +75,17 @@ def evaluate(args, options):
         "base_jerk_z_mps3",
         "max_torque_rate_nmps",
     ]
+    has_admittance = hasattr(env, "admittance_delta_l")
+    if has_admittance:
+        trace_keys += [
+            "admittance_delta_l_m",
+            "admittance_delta_l_dot_mps",
+            "admittance_axial_force_n",
+            "admittance_force_input_n",
+            "admittance_joint_offset_rad",
+        ]
     traces = {key: [] for key in trace_keys}
+
     event_keys = [
         "touchdown_speed_mps",
         "touchdown_speed_3d_mps",
@@ -109,6 +124,23 @@ def evaluate(args, options):
 
         if step_index >= warmup_steps:
             _append_traces(traces, env)
+            if has_admittance:
+                traces["admittance_delta_l_m"].append(
+                    env.admittance_delta_l.detach().cpu().numpy()
+                )
+                traces["admittance_delta_l_dot_mps"].append(
+                    env.admittance_delta_l_dot.detach().cpu().numpy()
+                )
+                traces["admittance_axial_force_n"].append(
+                    env.admittance_axial_force.detach().cpu().numpy()
+                )
+                traces["admittance_force_input_n"].append(
+                    env.admittance_force_input.detach().cpu().numpy()
+                )
+                traces["admittance_joint_offset_rad"].append(
+                    env.admittance_joint_offset.detach().cpu().numpy()
+                )
+
             _append_event_samples(event_samples, env)
             speeds = env.base_lin_vel[:, 0].detach().cpu().numpy()
             base_speed_samples.append(speeds)
@@ -142,6 +174,33 @@ def evaluate(args, options):
     for key, values in packed_events.items():
         _add_distribution(summary, key, values)
 
+    if has_admittance:
+        _add_distribution(
+            summary, "admittance_compression_m", packed_traces["admittance_delta_l_m"]
+        )
+        _add_distribution(
+            summary,
+            "admittance_compression_speed_abs_mps",
+            np.abs(packed_traces["admittance_delta_l_dot_mps"]),
+        )
+        _add_distribution(
+            summary, "admittance_axial_force_n", packed_traces["admittance_axial_force_n"]
+        )
+        _add_distribution(
+            summary, "admittance_force_input_n", packed_traces["admittance_force_input_n"]
+        )
+        _add_distribution(
+            summary,
+            "admittance_joint_offset_abs_rad",
+            np.abs(packed_traces["admittance_joint_offset_rad"]),
+        )
+        compression_values = np.asarray(packed_traces["admittance_delta_l_m"])
+        summary["admittance_active_ratio"] = (
+            float(np.mean(compression_values > 1.0e-4))
+            if compression_values.size
+            else 0.0
+        )
+
     speed_values = _pack(base_speed_samples)
     tracking_values = _pack(tracking_error_samples)
     orientation_values = _pack(orientation_error_samples)
@@ -160,12 +219,18 @@ def evaluate(args, options):
     reset_count = int(np.sum(reset_per_env_np))
     mean_speed = float(np.mean(speed_values)) if speed_values.size else 0.0
 
+    baseline_name = getattr(
+        env, "quiet_baseline_name", "MC_HIM_100Hz_fixed_pd_original_reward"
+    )
+    controller_name = getattr(env, "quiet_controller_name", "fixed_pd")
+
     summary.update(
         {
             "eval_protocol_version": 2,
             "task": "quiet_mc_100hz_v2",
             "robot": "mc",
-            "baseline": "MC_HIM_100Hz_fixed_pd_original_reward",
+            "baseline": baseline_name,
+            "controller": controller_name,
             "checkpoint_path": checkpoint_path,
             "scenario": scenario,
             "evaluation_seconds": float(options["eval_seconds"]),
@@ -222,8 +287,6 @@ def evaluate(args, options):
 
 
 if __name__ == "__main__":
-    # Strip custom evaluation flags before the Isaac Gym/legged-gym parser
-    # processes the remaining standard arguments.
     options = _extract_custom_args()
     args = get_args()
     evaluate(args, options)
