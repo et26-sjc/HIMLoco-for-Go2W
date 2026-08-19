@@ -27,6 +27,10 @@ class QuietMCAdmittance100HzV2(QuietMCV2, MCAdmittance100Hz):
                 "admittance_max_compression_m": self.admittance_max_compression,
                 "admittance_max_compression_velocity_mps": self.admittance_max_compression_vel,
                 "admittance_jacobian_damping": self.admittance_jacobian_damping,
+                "admittance_use_loading_rate_gate": self.admittance_use_loading_rate_gate,
+                "admittance_loading_rate_gate_nps": self.admittance_loading_rate_gate,
+                "admittance_gate_hold_time_s": self.admittance_gate_hold_time,
+                "admittance_freeze_bias_during_gate": self.admittance_freeze_bias_during_gate,
             }
         )
         return summary
