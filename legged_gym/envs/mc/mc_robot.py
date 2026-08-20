@@ -168,12 +168,19 @@ class MC(LeggedRobot):
         return torch.sum(torch.square(dof_vel), dim=1)
 
     def _reward_hip_default(self):
-        """Penalize only MC HIP_JOINT displacement from its nominal pose."""
-        hip_err = torch.sum(
+        """Match the original Go2W hip-default regularizer on hip-roll/ABAD.
+
+        In the Go2W URDF the first joint is named ``hip_joint`` but rotates
+        around the x-axis, i.e. it is physically the hip-roll/ABAD joint.  The
+        semantically equivalent MC joint is therefore ``ABAD_JOINT`` rather than
+        the y-axis ``HIP_JOINT`` (hip pitch).  Keeping the public reward name
+        ``hip_default`` preserves baseline reward/log compatibility.
+        """
+        abad_err = torch.sum(
             (
-                self.dof_pos[:, self.hip_indices]
-                - self.default_dof_pos[:, self.hip_indices]
+                self.dof_pos[:, self.abad_indices]
+                - self.default_dof_pos[:, self.abad_indices]
             ) ** 2,
             dim=1,
         )
-        return hip_err
+        return abad_err
