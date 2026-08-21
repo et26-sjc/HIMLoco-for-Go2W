@@ -2,11 +2,15 @@ import torch
 
 
 class MCContactCompliance:
-    """Lightweight contact-aware leg compliance for wheel-legged robots.
+    """Contact-aware knee compliance layer for MC wheel-legged locomotion.
 
-    This module is intentionally separated from HIMLoco policy learning. It
-    modifies only leg target references when large vertical contact impulses
-    appear, providing a first-order passive compliance approximation.
+    The module approximates a virtual spring:
+
+        Delta q = -(Fz - F_threshold) / K
+
+    It is intentionally separated from HIMLoco. The policy generates nominal
+    joint targets, and this module only provides transient knee flexion when
+    wheel-ground impact forces increase.
     """
 
     def __init__(self, cfg):
@@ -16,22 +20,18 @@ class MCContactCompliance:
         self.max_knee_offset = getattr(cfg, "max_knee_offset", 0.15)
 
     def compute_knee_offset(self, contact_forces, feet_indices):
-        """Compute knee target offsets from vertical contact force.
+        """Return four wheel/knee compliance offsets.
 
-        Fz > threshold generates knee flexion. The relation is equivalent to
-        a virtual spring:
-
-            Delta q = -(Fz-F0)/K
-
-        and is clipped for stability.
+        Negative offsets correspond to knee flexion, absorbing impact energy.
         """
-        if not self.enable:
-            return None
+        num_envs = contact_forces.shape[0]
+        device = contact_forces.device
 
-        fz = contact_forces[:, feet_indices, 2]
-        total_fz = torch.clamp(fz, min=0.0)
-        excess = torch.mean(torch.clamp(total_fz - self.force_threshold, min=0.0), dim=1)
+        if not self.enable:
+            return torch.zeros(num_envs, 4, device=device)
+
+        fz = torch.clamp(contact_forces[:, feet_indices, 2], min=0.0)
+        excess = torch.clamp(fz - self.force_threshold, min=0.0)
 
         offset = -excess / self.stiffness
-        offset = torch.clamp(offset, -self.max_knee_offset, 0.0)
-        return offset
+        return torch.clamp(offset, -self.max_knee_offset, 0.0)
