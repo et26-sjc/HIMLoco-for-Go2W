@@ -3,8 +3,8 @@
 Stage 1 intentionally protects the trained HIMLoco locomotion backbone:
 * the original HIM estimator is optionally frozen;
 * the original 16-D actor has an independent LR scale (zero by default);
-* ContactEstimator is never part of PPO's optimizer because it has its own
-  supervised optimizer;
+* ContactEstimator is never part of PPO's optimizer and retains its own
+  supervised learning rate, independent of PPO KL scheduling;
 * the adaptive motion/compliance heads, critic and action std remain trainable.
 """
 
@@ -40,9 +40,6 @@ class AdaptiveHIMPPO:
         self.base_actor_lr_scale = float(base_actor_lr_scale)
         self.update_him_estimator = bool(update_him_estimator)
 
-        # Do not put either estimator in the PPO optimizer. ContactEstimator has
-        # its own supervised optimizer; HIMEstimator also owns its optimizer and
-        # may be kept fully frozen during the first learned-admittance stage.
         base_actor_params = list(self.actor_critic.actor.parameters())
         adaptive_params = (
             list(self.actor_critic.motion_adapter.parameters())
@@ -86,7 +83,7 @@ class AdaptiveHIMPPO:
             "Adaptive PPO parameter policy: "
             f"base_actor_lr_scale={self.base_actor_lr_scale}, "
             f"update_him_estimator={self.update_him_estimator}; "
-            "contact estimator uses supervised-only gradients."
+            "contact estimator uses independent supervised-only gradients."
         )
 
     def init_storage(
@@ -229,12 +226,13 @@ class AdaptiveHIMPPO:
             else:
                 him_estimation, him_swap = 0.0, 0.0
 
+            # Deliberately do not pass PPO's adaptive learning rate here. Contact
+            # prediction is a separate supervised problem with its own optimizer.
             contact_force, contact_loading = (
                 self.actor_critic.contact_estimator.update(
                     obs_batch,
                     controller_state_batch,
                     contact_target_batch,
-                    lr=self.learning_rate,
                 )
             )
 
@@ -271,8 +269,6 @@ class AdaptiveHIMPPO:
             )
             self.optimizer.zero_grad()
             loss.backward()
-            # Only PPO-owned parameters are clipped here; estimator gradients are
-            # handled inside their dedicated update methods.
             ppo_params = []
             for group in self.optimizer.param_groups:
                 ppo_params.extend(group["params"])
