@@ -1,4 +1,12 @@
-"""PPO for learned MC admittance with separate HIM/contact estimator updates."""
+"""PPO for learned MC admittance with separate estimator optimization.
+
+Stage 1 intentionally protects the trained HIMLoco locomotion backbone:
+* the original HIM estimator is optionally frozen;
+* the original 16-D actor has an independent LR scale (zero by default);
+* ContactEstimator is never part of PPO's optimizer because it has its own
+  supervised optimizer;
+* the adaptive motion/compliance heads, critic and action std remain trainable.
+"""
 
 import torch
 import torch.nn as nn
@@ -23,11 +31,41 @@ class AdaptiveHIMPPO:
         use_clipped_value_loss=True,
         schedule="fixed",
         desired_kl=0.01,
+        base_actor_lr_scale=0.0,
+        update_him_estimator=False,
         device="cpu",
     ):
         self.device = device
         self.actor_critic = actor_critic.to(device)
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
+        self.base_actor_lr_scale = float(base_actor_lr_scale)
+        self.update_him_estimator = bool(update_him_estimator)
+
+        # Do not put either estimator in the PPO optimizer. ContactEstimator has
+        # its own supervised optimizer; HIMEstimator also owns its optimizer and
+        # may be kept fully frozen during the first learned-admittance stage.
+        base_actor_params = list(self.actor_critic.actor.parameters())
+        adaptive_params = (
+            list(self.actor_critic.motion_adapter.parameters())
+            + list(self.actor_critic.compliance_head.parameters())
+            + list(self.actor_critic.critic.parameters())
+            + [self.actor_critic.std]
+        )
+        self.optimizer = optim.Adam(
+            [
+                {
+                    "params": base_actor_params,
+                    "lr": learning_rate * self.base_actor_lr_scale,
+                    "lr_scale": self.base_actor_lr_scale,
+                    "name": "baseline_actor",
+                },
+                {
+                    "params": adaptive_params,
+                    "lr": learning_rate,
+                    "lr_scale": 1.0,
+                    "name": "adaptive_policy_critic",
+                },
+            ]
+        )
         self.transition = AdaptiveHIMRolloutStorage.Transition()
         self.storage = None
 
@@ -43,6 +81,13 @@ class AdaptiveHIMPPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+
+        print(
+            "Adaptive PPO parameter policy: "
+            f"base_actor_lr_scale={self.base_actor_lr_scale}, "
+            f"update_him_estimator={self.update_him_estimator}; "
+            "contact estimator uses supervised-only gradients."
+        )
 
     def init_storage(
         self,
@@ -106,6 +151,12 @@ class AdaptiveHIMPPO:
         last_values = self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
+    def _apply_learning_rate(self):
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.learning_rate * float(
+                group.get("lr_scale", 1.0)
+            )
+
     def _adapt_learning_rate(self, mu, sigma, old_mu, old_sigma):
         if self.desired_kl is None or self.schedule != "adaptive":
             return
@@ -125,8 +176,7 @@ class AdaptiveHIMPPO:
                 self.learning_rate = max(1.0e-5, self.learning_rate / 1.5)
             elif 0.0 < kl_mean < self.desired_kl / 2.0:
                 self.learning_rate = min(1.0e-2, self.learning_rate * 1.5)
-            for group in self.optimizer.param_groups:
-                group["lr"] = self.learning_rate
+            self._apply_learning_rate()
 
     def update(self):
         totals = {
@@ -170,11 +220,15 @@ class AdaptiveHIMPPO:
                 mu_batch, sigma_batch, old_mu_batch, old_sigma_batch
             )
 
-            him_estimation, him_swap = self.actor_critic.estimator.update(
-                obs_batch,
-                next_critic_obs_batch,
-                lr=self.learning_rate,
-            )
+            if self.update_him_estimator:
+                him_estimation, him_swap = self.actor_critic.estimator.update(
+                    obs_batch,
+                    next_critic_obs_batch,
+                    lr=self.learning_rate,
+                )
+            else:
+                him_estimation, him_swap = 0.0, 0.0
+
             contact_force, contact_loading = (
                 self.actor_critic.contact_estimator.update(
                     obs_batch,
@@ -217,9 +271,12 @@ class AdaptiveHIMPPO:
             )
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                self.actor_critic.parameters(), self.max_grad_norm
-            )
+            # Only PPO-owned parameters are clipped here; estimator gradients are
+            # handled inside their dedicated update methods.
+            ppo_params = []
+            for group in self.optimizer.param_groups:
+                ppo_params.extend(group["params"])
+            nn.utils.clip_grad_norm_(ppo_params, self.max_grad_norm)
             self.optimizer.step()
 
             totals["value"] += value_loss.item()
