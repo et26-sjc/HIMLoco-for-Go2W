@@ -14,8 +14,6 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
         num_motion_actions = 16
         num_compliance_actions = 4
         num_policy_actions = 20
-        # normalized compression(4), compression velocity(4), alpha(4),
-        # support-force bias(4). All are deployable controller-internal states.
         controller_state_dim = 16
         contact_estimate_dim = 8
 
@@ -70,7 +68,10 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         compliance_init_std = 0.05
 
     class algorithm(MC100HzCfgPPO.algorithm):
+        # Stage 1 freezes every baseline-policy degree of freedom. The four new
+        # compliance dimensions use a fixed small exploration std=0.05.
         base_actor_lr_scale = 0.0
+        action_std_lr_scale = 0.0
         update_him_estimator = False
 
     class runner(MC100HzCfgPPO.runner):
