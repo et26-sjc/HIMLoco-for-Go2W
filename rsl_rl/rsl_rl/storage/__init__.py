@@ -3,3 +3,4 @@
 
 from .rollout_storage import RolloutStorage
 from .him_rollout_storage import HIMRolloutStorage
+from .adaptive_him_rollout_storage import AdaptiveHIMRolloutStorage
