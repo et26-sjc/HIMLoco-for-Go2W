@@ -1,8 +1,8 @@
 """Learned, sensorless per-leg admittance controller for the MC robot.
 
-This module deliberately contains no simulator contact-force reads.  It accepts
+This module deliberately contains no simulator contact-force reads. It accepts
 only the contact state predicted by the policy-side estimator plus the four RL
-compliance actions.  Consequently the same controller can be used in Isaac Gym,
+compliance actions. Consequently the same controller can be used in Isaac Gym,
 MuJoCo and on hardware without a force sensor.
 
 Per leg, the virtual dynamics are
@@ -11,12 +11,10 @@ Per leg, the virtual dynamics are
 
 where ``alpha`` is the extra RL compliance action in [0, 1], ``F_transient`` is
 computed from the *estimated* contact force after subtracting a slow support
-force baseline, and ``g(dF)`` is a smooth loading-rate gate.  The resulting
-axial leg compression is mapped to HIP/KNEE target offsets through a damped
+force baseline, and ``g(dF)`` is a smooth loading-rate gate. The resulting axial
+leg compression is mapped to HIP/KNEE target offsets through a damped
 least-squares Jacobian.
 """
-
-import math
 
 import torch
 
@@ -70,12 +68,12 @@ class MCLearnedAdmittance:
         self.transient_force[env_ids] = 0.0
 
     def state(self):
-        """Deployable controller state exposed to the actor observation.
+        """Deployable controller state exposed to the adaptive policy.
 
-        Returns [delta_l(4), delta_l_dot(4)].  These are controller-internal
-        quantities and therefore remain available on hardware.
+        Returns [delta_l(4), delta_l_dot(4), alpha(4)] = 12 dimensions. These are
+        controller-internal quantities and therefore remain available on hardware.
         """
-        return torch.cat((self.delta_l, self.delta_l_dot), dim=-1)
+        return torch.cat((self.delta_l, self.delta_l_dot, self.alpha), dim=-1)
 
     def _decode_contact_estimate(self, estimated_contact):
         if estimated_contact.shape[-1] != 8:
@@ -101,12 +99,10 @@ class MCLearnedAdmittance:
         qk = q_nom[:, knee_indices]
         qhk = qh + qk
 
-        # Two-link sagittal FK derived from bot_mc.urdf (0.20 m + 0.22 m).
         x = -self.l1 * torch.sin(qh) - self.l2 * torch.sin(qhk)
         z = -self.l1 * torch.cos(qh) - self.l2 * torch.cos(qhk)
         leg_len = torch.clamp(torch.sqrt(x * x + z * z), min=1.0e-6)
 
-        # Positive delta_l means shortening the hip-to-wheel distance.
         dp_x = -self.delta_l * (x / leg_len)
         dp_z = -self.delta_l * (z / leg_len)
 
@@ -140,24 +136,16 @@ class MCLearnedAdmittance:
         knee_indices,
         dt,
     ):
-        """Advance the admittance and return per-leg [HIP, KNEE] offsets.
-
-        ``compliance_action`` is the policy's extra four-dimensional output.  It
-        is intentionally interpreted as a non-negative compliance activation,
-        not as a direct joint residual.  Zero therefore reproduces the original
-        HIMLoco controller exactly.
-        """
+        """Advance the admittance and return per-leg [HIP, KNEE] offsets."""
         if compliance_action.shape[-1] != 4:
             raise RuntimeError(
                 f"Expected 4-D compliance action, got {tuple(compliance_action.shape)}"
             )
 
-        # Keeping zero -> zero is important for baseline checkpoint migration.
+        # Zero compliance reproduces the original HIMLoco controller exactly.
         alpha = torch.clamp(compliance_action, 0.0, 1.0)
         force, loading_rate = self._decode_contact_estimate(estimated_contact)
 
-        # A slowly varying baseline represents ordinary support load.  Fast
-        # loading should not be absorbed into this baseline immediately.
         gate = self._loading_gate(loading_rate)
         bias_alpha = float(dt) / max(float(dt) + self.force_bias_tau, 1.0e-6)
         bias_update = bias_alpha * (force - self.force_bias)
@@ -175,9 +163,6 @@ class MCLearnedAdmittance:
             torch.clamp(self.mass * stiffness, min=1.0e-6)
         )
 
-        # The RL action decides whether the estimated impact is allowed to drive
-        # the compliant mode.  With alpha=0 the virtual spring simply relaxes to
-        # zero and the physical controller is the baseline controller.
         drive = alpha * gate * transient
         delta_l_ddot = (
             drive - damping * self.delta_l_dot - stiffness * self.delta_l
