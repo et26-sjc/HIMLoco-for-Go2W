@@ -64,14 +64,15 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         contact_estimator_lr = 1.0e-3
         contact_estimator_loss_force = 1.0
         contact_estimator_loss_loading = 0.5
-        motion_adapter_scale = 0.05
+
+        # Stage 1 learns only when/how much to engage compliance. The baseline
+        # 16-D motion command is therefore *exactly* preserved. After this works,
+        # a Stage-2 co-adaptation run can raise this to e.g. 0.05 and use a small
+        # base_actor_lr_scale if motion compensation is demonstrably necessary.
+        motion_adapter_scale = 0.0
         compliance_init_std = 0.05
 
     class algorithm(MC100HzCfgPPO.algorithm):
-        # Stage-1 principle: preserve the already-good locomotion backbone.
-        # PPO updates critic + new adaptive policy heads, while the original
-        # 16-D actor and original HIM estimator stay fixed. A later joint-finetune
-        # experiment can set these to nonzero/True.
         base_actor_lr_scale = 0.0
         update_him_estimator = False
 
@@ -96,4 +97,5 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
             "learned-admittance",
             "policy20-physical16",
             "stage1-frozen-locomotion",
+            "stage1-compliance-only",
         ]
