@@ -14,7 +14,9 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
         num_motion_actions = 16
         num_compliance_actions = 4
         num_policy_actions = 20
-        controller_state_dim = 12
+        # normalized compression(4), compression velocity(4), alpha(4),
+        # support-force bias(4). All are deployable controller-internal states.
+        controller_state_dim = 16
         contact_estimate_dim = 8
 
     class learned_admittance:
@@ -64,9 +66,6 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         contact_estimator_lr = 1.0e-3
         contact_estimator_loss_force = 1.0
         contact_estimator_loss_loading = 0.5
-
-        # Stage 1 learns only when/how much to engage compliance. The baseline
-        # 16-D motion command is therefore exactly preserved.
         motion_adapter_scale = 0.0
         compliance_init_std = 0.05
 
@@ -85,9 +84,6 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         init_load_run = -1
         init_checkpoint = -1
 
-        # Stage 0: execute deterministic baseline motion with alpha=0 and train
-        # only ContactEstimator before PPO is allowed to learn compliance. With
-        # 4096 envs, 500 policy transitions already provide ~2M labeled samples.
         contact_pretrain_steps = 500
         contact_pretrain_log_interval = 50
 
