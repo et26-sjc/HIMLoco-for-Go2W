@@ -102,6 +102,106 @@ class AdaptiveHIMOnPolicyRunner:
             save_code=True,
         )
 
+    def _contact_pretrain(self, obs, controller_state, critic_obs):
+        """Stage 0: learn impact prediction while executing exact baseline motion.
+
+        PPO is not involved. The deterministic baseline actor is used, the four
+        compliance outputs are forcibly zeroed, and only ContactEstimator receives
+        gradients from simulator-only axial force/loading targets.
+        """
+        num_steps = int(self.cfg.get("contact_pretrain_steps", 0))
+        if num_steps <= 0:
+            return obs, controller_state, critic_obs
+        interval = max(1, int(self.cfg.get("contact_pretrain_log_interval", 50)))
+
+        print(
+            f"[contact warmup] starting {num_steps} deterministic baseline "
+            "policy steps; compliance is forced to zero."
+        )
+        self.actor_critic.train()
+        running_force = 0.0
+        running_loading = 0.0
+        window_count = 0
+        start_time = time.time()
+
+        for step in range(num_steps):
+            # Estimator prediction is part of the forward pass, but alpha is
+            # explicitly forced to zero so prediction errors cannot affect motion.
+            with torch.no_grad():
+                actions = self.actor_critic.act_inference(
+                    obs, controller_state
+                ).detach()
+                actions[:, self.env.num_actions :] = 0.0
+                contact_estimate = self.actor_critic.last_contact_estimate.detach()
+
+                (
+                    next_obs,
+                    next_privileged_obs,
+                    _rewards,
+                    _dones,
+                    _infos,
+                    _termination_ids,
+                    _termination_privileged_obs,
+                ) = self.env.step(actions, contact_estimate)
+                target = self.env.get_contact_estimator_target().to(self.device)
+                next_controller_state = self.env.get_controller_state().to(
+                    self.device
+                )
+                next_obs = next_obs.to(self.device)
+                next_critic_obs = (
+                    next_privileged_obs
+                    if next_privileged_obs is not None
+                    else next_obs
+                ).to(self.device)
+
+            force_loss, loading_loss = self.actor_critic.contact_estimator.update(
+                obs, controller_state, target
+            )
+            running_force += force_loss
+            running_loading += loading_loss
+            window_count += 1
+
+            obs = next_obs
+            controller_state = next_controller_state
+            critic_obs = next_critic_obs
+
+            if (step + 1) % interval == 0 or step + 1 == num_steps:
+                avg_force = running_force / max(window_count, 1)
+                avg_loading = running_loading / max(window_count, 1)
+                print(
+                    f"[contact warmup] step={step + 1}/{num_steps} "
+                    f"force_loss={avg_force:.5f} "
+                    f"loading_loss={avg_loading:.5f}"
+                )
+                if self.writer is not None:
+                    self.writer.add_scalar(
+                        "Warmup/contact_force_loss", avg_force, step + 1
+                    )
+                    self.writer.add_scalar(
+                        "Warmup/contact_loading_loss", avg_loading, step + 1
+                    )
+                if self.wandb_run is not None:
+                    self.wandb_run.log(
+                        {
+                            "Warmup/contact_force_loss": avg_force,
+                            "Warmup/contact_loading_loss": avg_loading,
+                        },
+                        step=-(num_steps - step),
+                    )
+                running_force = 0.0
+                running_loading = 0.0
+                window_count = 0
+
+        elapsed = time.time() - start_time
+        self.tot_timesteps += num_steps * self.env.num_envs
+        print(
+            f"[contact warmup] finished in {elapsed:.2f}s; PPO compliance "
+            "learning can now start."
+        )
+        if self.log_dir is not None:
+            self.save(os.path.join(self.log_dir, "contact_pretrained.pt"))
+        return obs, controller_state, critic_obs
+
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
@@ -119,6 +219,13 @@ class AdaptiveHIMOnPolicyRunner:
         critic_obs = privileged_obs if privileged_obs is not None else obs
         critic_obs = critic_obs.to(self.device)
         self.actor_critic.train()
+
+        # Run Stage 0 only for a newly initialized adaptive experiment. A resumed
+        # adaptive checkpoint already contains a trained ContactEstimator.
+        if self.current_learning_iteration == 0:
+            obs, controller_state, critic_obs = self._contact_pretrain(
+                obs, controller_state, critic_obs
+            )
 
         ep_infos = []
         rewbuffer = deque(maxlen=100)
@@ -317,8 +424,6 @@ class AdaptiveHIMOnPolicyRunner:
                     loaded["contact_estimator_optimizer_state_dict"]
                 )
         else:
-            # Baseline migration: copy every shape-compatible HIM/actor/critic
-            # tensor.  New contact/compliance modules keep their safe init.
             current = self.actor_critic.state_dict()
             copied = []
             skipped = []
