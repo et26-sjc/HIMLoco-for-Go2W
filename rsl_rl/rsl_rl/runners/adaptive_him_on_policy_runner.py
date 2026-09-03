@@ -66,6 +66,7 @@ class AdaptiveHIMOnPolicyRunner:
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+        self.contact_warmup_done = False
         _, _ = self.env.reset()
 
     def _init_wandb(self):
@@ -103,14 +104,10 @@ class AdaptiveHIMOnPolicyRunner:
         )
 
     def _contact_pretrain(self, obs, controller_state, critic_obs):
-        """Stage 0: learn impact prediction while executing exact baseline motion.
-
-        PPO is not involved. The deterministic baseline actor is used, the four
-        compliance outputs are forcibly zeroed, and only ContactEstimator receives
-        gradients from simulator-only axial force/loading targets.
-        """
+        """Stage 0: train only ContactEstimator under exact baseline motion."""
         num_steps = int(self.cfg.get("contact_pretrain_steps", 0))
         if num_steps <= 0:
+            self.contact_warmup_done = True
             return obs, controller_state, critic_obs
         interval = max(1, int(self.cfg.get("contact_pretrain_log_interval", 50)))
 
@@ -125,8 +122,6 @@ class AdaptiveHIMOnPolicyRunner:
         start_time = time.time()
 
         for step in range(num_steps):
-            # Estimator prediction is part of the forward pass, but alpha is
-            # explicitly forced to zero so prediction errors cannot affect motion.
             with torch.no_grad():
                 actions = self.actor_critic.act_inference(
                     obs, controller_state
@@ -180,20 +175,16 @@ class AdaptiveHIMOnPolicyRunner:
                     self.writer.add_scalar(
                         "Warmup/contact_loading_loss", avg_loading, step + 1
                     )
-                if self.wandb_run is not None:
-                    self.wandb_run.log(
-                        {
-                            "Warmup/contact_force_loss": avg_force,
-                            "Warmup/contact_loading_loss": avg_loading,
-                        },
-                        step=-(num_steps - step),
-                    )
+                # Do not write warm-up samples with explicit W&B steps: PPO uses
+                # iteration numbers beginning at zero, so mixing those two step
+                # domains would create non-monotonic W&B histories.
                 running_force = 0.0
                 running_loading = 0.0
                 window_count = 0
 
         elapsed = time.time() - start_time
         self.tot_timesteps += num_steps * self.env.num_envs
+        self.contact_warmup_done = True
         print(
             f"[contact warmup] finished in {elapsed:.2f}s; PPO compliance "
             "learning can now start."
@@ -220,9 +211,7 @@ class AdaptiveHIMOnPolicyRunner:
         critic_obs = critic_obs.to(self.device)
         self.actor_critic.train()
 
-        # Run Stage 0 only for a newly initialized adaptive experiment. A resumed
-        # adaptive checkpoint already contains a trained ContactEstimator.
-        if self.current_learning_iteration == 0:
+        if not self.contact_warmup_done:
             obs, controller_state, critic_obs = self._contact_pretrain(
                 obs, controller_state, critic_obs
             )
@@ -403,6 +392,7 @@ class AdaptiveHIMOnPolicyRunner:
                     self.actor_critic.contact_estimator.optimizer.state_dict()
                 ),
                 "iter": self.current_learning_iteration,
+                "contact_warmup_done": self.contact_warmup_done,
                 "infos": infos,
             },
             path,
@@ -415,6 +405,11 @@ class AdaptiveHIMOnPolicyRunner:
 
         if is_adaptive:
             self.actor_critic.load_state_dict(incoming)
+            # Older adaptive checkpoints did not save this flag; if they already
+            # contain a ContactEstimator, default to not repeating warm-up.
+            self.contact_warmup_done = bool(
+                loaded.get("contact_warmup_done", True)
+            )
             if load_optimizer and "optimizer_state_dict" in loaded:
                 self.alg.optimizer.load_state_dict(loaded["optimizer_state_dict"])
                 self.actor_critic.estimator.optimizer.load_state_dict(
@@ -438,6 +433,7 @@ class AdaptiveHIMOnPolicyRunner:
                 else:
                     skipped.append(key)
             self.actor_critic.load_state_dict(current)
+            self.contact_warmup_done = False
             print(
                 f"Migrated baseline checkpoint: copied={len(copied)}, "
                 f"skipped={len(skipped)}; new compliance/contact modules "
