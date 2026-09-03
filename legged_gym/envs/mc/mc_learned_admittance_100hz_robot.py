@@ -2,13 +2,15 @@
 
 The environment separates three information domains explicitly:
 
-* ``self.actions``: original 16-D HIMLoco motion action (and therefore the
-  original 57-D proprioceptive observation layout remains unchanged);
+* ``self.actions``: original 16-D HIMLoco motion action (the original 57-D
+  proprioceptive observation layout remains unchanged);
 * policy-only extra action: four compliance activations;
 * training-only ground-truth impact signals from Isaac Gym contact tensors.
 
-The physical admittance never reads ground-truth contact force. It is driven
-only by the contact estimator output supplied by the policy/runner.
+The deployed admittance never reads ground-truth contact force. During training,
+3-D wheel contact force is used in two different ways: force norm/loading-rate
+norm supervise quiet rewards, while the force projected onto each hip-to-wheel
+axis supervises the contact estimator that drives the physical admittance.
 """
 
 from isaacgym import gymtorch
@@ -23,10 +25,11 @@ class MCLearnedAdmittance100Hz(MC):
     """MC with 20-D policy action but unchanged 16-D physical actuation."""
 
     _LEG_SPECS = [
-        ("FL", "FL_FOOT_LINK", "FBL_HIP_JOINT", "FBL_KNEE_JOINT"),
-        ("FR", "FR_FOOT_LINK", "FAR_HIP_JOINT", "FAR_KNEE_JOINT"),
-        ("RR", "RR_FOOT_LINK", "RAR_HIP_JOINT", "RAR_KNEE_JOINT"),
-        ("RL", "RL_FOOT_LINK", "RBL_HIP_JOINT", "RBL_KNEE_JOINT"),
+        # leg, wheel body, hip body, hip joint, knee joint
+        ("FL", "FL_FOOT_LINK", "FL_HIP_LINK", "FBL_HIP_JOINT", "FBL_KNEE_JOINT"),
+        ("FR", "FR_FOOT_LINK", "FR_HIP_LINK", "FAR_HIP_JOINT", "FAR_KNEE_JOINT"),
+        ("RR", "RR_FOOT_LINK", "RR_HIP_LINK", "RAR_HIP_JOINT", "RAR_KNEE_JOINT"),
+        ("RL", "RL_FOOT_LINK", "RL_HIP_LINK", "RBL_HIP_JOINT", "RBL_KNEE_JOINT"),
     ]
 
     def _init_buffers(self):
@@ -45,10 +48,13 @@ class MCLearnedAdmittance100Hz(MC):
         if self.num_policy_actions != self.num_motion_actions + self.num_compliance_actions:
             raise RuntimeError("Policy action dimensions are inconsistent")
 
-        foot_ids, hip_ids, knee_ids = [], [], []
-        for leg, foot_name, hip_name, knee_name in self._LEG_SPECS:
+        foot_ids, hip_body_ids, hip_ids, knee_ids = [], [], [], []
+        for leg, foot_name, hip_body_name, hip_name, knee_name in self._LEG_SPECS:
             foot_id = self.gym.find_actor_rigid_body_handle(
                 self.envs[0], self.actor_handles[0], foot_name
+            )
+            hip_body_id = self.gym.find_actor_rigid_body_handle(
+                self.envs[0], self.actor_handles[0], hip_body_name
             )
             hip_id = self.gym.find_actor_dof_handle(
                 self.envs[0], self.actor_handles[0], hip_name
@@ -56,23 +62,27 @@ class MCLearnedAdmittance100Hz(MC):
             knee_id = self.gym.find_actor_dof_handle(
                 self.envs[0], self.actor_handles[0], knee_name
             )
-            if min(foot_id, hip_id, knee_id) < 0:
+            if min(foot_id, hip_body_id, hip_id, knee_id) < 0:
                 raise RuntimeError(
-                    f"Failed to resolve semantic leg {leg}: "
-                    f"foot={foot_id}, hip={hip_id}, knee={knee_id}"
+                    f"Failed to resolve semantic leg {leg}: foot={foot_id}, "
+                    f"hip_body={hip_body_id}, hip={hip_id}, knee={knee_id}"
                 )
             foot_ids.append(foot_id)
+            hip_body_ids.append(hip_body_id)
             hip_ids.append(hip_id)
             knee_ids.append(knee_id)
 
         self.adm_feet_indices = torch.tensor(foot_ids, dtype=torch.long, device=self.device)
+        self.adm_hip_body_indices = torch.tensor(
+            hip_body_ids, dtype=torch.long, device=self.device
+        )
         self.adm_hip_indices = torch.tensor(hip_ids, dtype=torch.long, device=self.device)
         self.adm_knee_indices = torch.tensor(knee_ids, dtype=torch.long, device=self.device)
 
         print("### Learned-admittance leg order:")
         for i, spec in enumerate(self._LEG_SPECS):
             print(
-                f"  {i}:{spec[0]} foot={foot_ids[i]} "
+                f"  {i}:{spec[0]} foot={foot_ids[i]} hip_body={hip_body_ids[i]} "
                 f"hip={hip_ids[i]} knee={knee_ids[i]}"
             )
 
@@ -90,9 +100,18 @@ class MCLearnedAdmittance100Hz(MC):
         )
 
         shape = (self.num_envs, 4)
+        # Quiet metrics use full 3-D force magnitude.
         self.gt_step_peak_force = torch.zeros(shape, device=self.device)
         self.gt_step_peak_loading_rate = torch.zeros(shape, device=self.device)
         self.gt_prev_force_norm = torch.zeros(shape, device=self.device)
+        # Estimator targets use compressive axial force along hip -> wheel.
+        self.gt_step_peak_axial_force = torch.zeros(shape, device=self.device)
+        self.gt_step_peak_axial_loading_rate = torch.zeros(shape, device=self.device)
+        self.gt_prev_axial_force = torch.zeros(shape, device=self.device)
+        self.gt_skip_rate_once = torch.ones(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
         self.gt_step_peak_base_acc = torch.zeros(self.num_envs, device=self.device)
         self.gt_prev_base_vel_z = self._base_vel_z().clone()
         self.contact_estimator_target = torch.zeros(
@@ -117,22 +136,52 @@ class MCLearnedAdmittance100Hz(MC):
         return state
 
     def get_contact_estimator_target(self):
-        """Return the transition target even if envs reset inside post-step."""
         return self.transition_contact_estimator_target
 
     def _begin_gt_impact_step(self):
         self.gt_step_peak_force.zero_()
         self.gt_step_peak_loading_rate.zero_()
+        self.gt_step_peak_axial_force.zero_()
+        self.gt_step_peak_axial_loading_rate.zero_()
         self.gt_step_peak_base_acc.zero_()
+
+    def _ground_truth_contact_signals(self):
+        force_vec = self.contact_forces[:, self.adm_feet_indices, :]
+        force_norm = torch.norm(force_vec, dim=-1)
+
+        states = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)
+        hip_pos = states[:, self.adm_hip_body_indices, 0:3]
+        wheel_pos = states[:, self.adm_feet_indices, 0:3]
+        leg_vec = wheel_pos - hip_pos
+        leg_axis = leg_vec / torch.clamp(
+            torch.norm(leg_vec, dim=-1, keepdim=True), min=1.0e-6
+        )
+        # leg_axis points hip -> wheel; compressive GRF points wheel -> hip.
+        axial_force = torch.clamp(
+            torch.sum(force_vec * (-leg_axis), dim=-1), min=0.0
+        )
+        return force_norm, axial_force
 
     def _update_gt_impact_substep(self):
         physics_dt = float(self.sim_params.dt)
-        force_vec = self.contact_forces[:, self.adm_feet_indices, :]
-        force_norm = torch.norm(force_vec, dim=-1)
+        force_norm, axial_force = self._ground_truth_contact_signals()
+
         loading_rate = torch.clamp(
             (force_norm - self.gt_prev_force_norm) / physics_dt, min=0.0
         )
+        axial_loading_rate = torch.clamp(
+            (axial_force - self.gt_prev_axial_force) / physics_dt, min=0.0
+        )
+        if torch.any(self.gt_skip_rate_once):
+            mask = self.gt_skip_rate_once.unsqueeze(1)
+            loading_rate = torch.where(mask, torch.zeros_like(loading_rate), loading_rate)
+            axial_loading_rate = torch.where(
+                mask, torch.zeros_like(axial_loading_rate), axial_loading_rate
+            )
+            self.gt_skip_rate_once.zero_()
+
         self.gt_prev_force_norm.copy_(force_norm)
+        self.gt_prev_axial_force.copy_(axial_force)
 
         base_vel_z = self._base_vel_z()
         base_acc = torch.abs((base_vel_z - self.gt_prev_base_vel_z) / physics_dt)
@@ -142,14 +191,20 @@ class MCLearnedAdmittance100Hz(MC):
         self.gt_step_peak_loading_rate = torch.maximum(
             self.gt_step_peak_loading_rate, loading_rate
         )
+        self.gt_step_peak_axial_force = torch.maximum(
+            self.gt_step_peak_axial_force, axial_force
+        )
+        self.gt_step_peak_axial_loading_rate = torch.maximum(
+            self.gt_step_peak_axial_loading_rate, axial_loading_rate
+        )
         self.gt_step_peak_base_acc = torch.maximum(
             self.gt_step_peak_base_acc, base_acc
         )
 
     def _finish_gt_impact_step(self):
         cfg = self.cfg.learned_admittance
-        force = self.gt_step_peak_force / float(cfg.contact_force_scale_n)
-        loading = self.gt_step_peak_loading_rate / float(
+        force = self.gt_step_peak_axial_force / float(cfg.contact_force_scale_n)
+        loading = self.gt_step_peak_axial_loading_rate / float(
             cfg.contact_loading_rate_scale_nps
         )
         clip = float(cfg.contact_target_clip)
@@ -212,9 +267,7 @@ class MCLearnedAdmittance100Hz(MC):
         vel_ref[:, self.wheel_indices] = vel_tmp[:, self.wheel_indices]
 
         if self.cfg.control.control_type != "P":
-            raise RuntimeError(
-                "Learned admittance v1 currently requires control_type='P'."
-            )
+            raise RuntimeError("Learned admittance v1 currently requires control_type='P'.")
         torques = (
             self.p_gains * self.Kp_factors * pos_err
             + self.d_gains * self.Kd_factors * (vel_ref - self.dof_vel)
@@ -222,7 +275,6 @@ class MCLearnedAdmittance100Hz(MC):
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
     def step(self, policy_actions, contact_estimate=None):
-        """Execute a 20-D policy action while physically actuating only 16 DOFs."""
         motion_actions, compliance_actions = self._split_policy_action(policy_actions)
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(motion_actions, -clip_actions, clip_actions).to(
@@ -231,18 +283,15 @@ class MCLearnedAdmittance100Hz(MC):
         self.compliance_actions = torch.clamp(
             compliance_actions.to(self.device), 0.0, 1.0
         )
-        # Always keep this cache 20-D, including BaseTask.reset's legacy 16-D call.
-        self.policy_actions = torch.cat(
-            (self.actions, self.compliance_actions), dim=-1
-        )
+        self.policy_actions = torch.cat((self.actions, self.compliance_actions), dim=-1)
 
         if contact_estimate is None:
             self.estimated_contact.zero_()
         else:
             if contact_estimate.shape[-1] != self.contact_estimate_dim:
                 raise RuntimeError(
-                    f"Expected {self.contact_estimate_dim}D contact estimate, "
-                    f"got {contact_estimate.shape[-1]}D"
+                    f"Expected {self.contact_estimate_dim}D contact estimate, got "
+                    f"{contact_estimate.shape[-1]}D"
                 )
             self.estimated_contact.copy_(contact_estimate.to(self.device))
 
@@ -279,11 +328,7 @@ class MCLearnedAdmittance100Hz(MC):
             self._update_gt_impact_substep()
 
         self._finish_gt_impact_step()
-        # post_physics_step may reset some envs; preserve the target generated by
-        # this transition before that reset occurs.
-        self.transition_contact_estimator_target.copy_(
-            self.contact_estimator_target
-        )
+        self.transition_contact_estimator_target.copy_(self.contact_estimator_target)
         termination_ids, termination_privileged_obs = self.post_physics_step()
 
         clip_obs = self.cfg.normalization.clip_observations
@@ -313,6 +358,10 @@ class MCLearnedAdmittance100Hz(MC):
         self.gt_step_peak_force[env_ids] = 0.0
         self.gt_step_peak_loading_rate[env_ids] = 0.0
         self.gt_prev_force_norm[env_ids] = 0.0
+        self.gt_step_peak_axial_force[env_ids] = 0.0
+        self.gt_step_peak_axial_loading_rate[env_ids] = 0.0
+        self.gt_prev_axial_force[env_ids] = 0.0
+        self.gt_skip_rate_once[env_ids] = True
         self.gt_step_peak_base_acc[env_ids] = 0.0
         self.contact_estimator_target[env_ids] = 0.0
         self.gt_prev_base_vel_z[env_ids] = self._base_vel_z()[env_ids]
