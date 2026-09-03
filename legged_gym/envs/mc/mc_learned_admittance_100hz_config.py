@@ -66,9 +66,7 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         contact_estimator_loss_loading = 0.5
 
         # Stage 1 learns only when/how much to engage compliance. The baseline
-        # 16-D motion command is therefore *exactly* preserved. After this works,
-        # a Stage-2 co-adaptation run can raise this to e.g. 0.05 and use a small
-        # base_actor_lr_scale if motion compensation is demonstrably necessary.
+        # 16-D motion command is therefore exactly preserved.
         motion_adapter_scale = 0.0
         compliance_init_std = 0.05
 
@@ -87,6 +85,12 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         init_load_run = -1
         init_checkpoint = -1
 
+        # Stage 0: execute deterministic baseline motion with alpha=0 and train
+        # only ContactEstimator before PPO is allowed to learn compliance. With
+        # 4096 envs, 500 policy transitions already provide ~2M labeled samples.
+        contact_pretrain_steps = 500
+        contact_pretrain_log_interval = 50
+
         wandb_group = "mc-learned-admittance"
         wandb_tags = [
             "MC",
@@ -96,6 +100,7 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
             "sensorless-contact-estimator",
             "learned-admittance",
             "policy20-physical16",
+            "stage0-contact-warmup",
             "stage1-frozen-locomotion",
             "stage1-compliance-only",
         ]
