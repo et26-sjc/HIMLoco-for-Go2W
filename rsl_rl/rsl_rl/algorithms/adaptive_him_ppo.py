@@ -1,11 +1,11 @@
 """PPO for learned MC admittance with separate estimator optimization.
 
 Stage 1 intentionally protects the trained HIMLoco locomotion backbone:
-* the original HIM estimator is optionally frozen;
-* the original 16-D actor has an independent LR scale (zero by default);
-* ContactEstimator is never part of PPO's optimizer and retains its own
-  supervised learning rate, independent of PPO KL scheduling;
-* the adaptive motion/compliance heads, critic and action std remain trainable.
+* original HIM estimator optionally frozen;
+* original 16-D actor independently frozen/scaled;
+* policy std independently frozen/scaled;
+* ContactEstimator uses only its supervised optimizer;
+* compliance head and critic remain PPO-trainable.
 """
 
 import torch
@@ -32,12 +32,14 @@ class AdaptiveHIMPPO:
         schedule="fixed",
         desired_kl=0.01,
         base_actor_lr_scale=0.0,
+        action_std_lr_scale=0.0,
         update_him_estimator=False,
         device="cpu",
     ):
         self.device = device
         self.actor_critic = actor_critic.to(device)
         self.base_actor_lr_scale = float(base_actor_lr_scale)
+        self.action_std_lr_scale = float(action_std_lr_scale)
         self.update_him_estimator = bool(update_him_estimator)
 
         base_actor_params = list(self.actor_critic.actor.parameters())
@@ -45,7 +47,6 @@ class AdaptiveHIMPPO:
             list(self.actor_critic.motion_adapter.parameters())
             + list(self.actor_critic.compliance_head.parameters())
             + list(self.actor_critic.critic.parameters())
-            + [self.actor_critic.std]
         )
         self.optimizer = optim.Adam(
             [
@@ -60,6 +61,12 @@ class AdaptiveHIMPPO:
                     "lr": learning_rate,
                     "lr_scale": 1.0,
                     "name": "adaptive_policy_critic",
+                },
+                {
+                    "params": [self.actor_critic.std],
+                    "lr": learning_rate * self.action_std_lr_scale,
+                    "lr_scale": self.action_std_lr_scale,
+                    "name": "action_std",
                 },
             ]
         )
@@ -82,6 +89,7 @@ class AdaptiveHIMPPO:
         print(
             "Adaptive PPO parameter policy: "
             f"base_actor_lr_scale={self.base_actor_lr_scale}, "
+            f"action_std_lr_scale={self.action_std_lr_scale}, "
             f"update_him_estimator={self.update_him_estimator}; "
             "contact estimator uses independent supervised-only gradients."
         )
@@ -226,8 +234,6 @@ class AdaptiveHIMPPO:
             else:
                 him_estimation, him_swap = 0.0, 0.0
 
-            # Deliberately do not pass PPO's adaptive learning rate here. Contact
-            # prediction is a separate supervised problem with its own optimizer.
             contact_force, contact_loading = (
                 self.actor_critic.contact_estimator.update(
                     obs_batch,
