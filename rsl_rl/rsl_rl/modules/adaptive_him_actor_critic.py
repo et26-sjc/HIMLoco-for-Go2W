@@ -3,8 +3,7 @@
 The original HIM estimator and 16-D locomotion actor are preserved. New modules:
 1) a supervised ContactEstimator using deployable inputs only;
 2) a zero-initialized 4-D compliance head;
-3) a small zero-initialized motion adapter so the locomotion policy can learn
-   limited compensation for the controller-induced leg compression.
+3) a small zero-initialized motion adapter for optional later co-adaptation.
 """
 
 import torch
@@ -62,13 +61,10 @@ class AdaptiveHIMActorCritic(nn.Module):
         self.contact_estimate_dim = int(contact_estimate_dim)
         self.motion_adapter_scale = float(motion_adapter_scale)
 
-        # Original HIM estimator: history -> base velocity(3) + latent(16).
         self.estimator = HIMEstimator(
             temporal_steps=self.history_size,
             num_one_step_obs=self.num_one_step_obs,
         )
-
-        # Training target is privileged, but estimator inputs are deployable.
         self.contact_estimator = ContactEstimator(
             history_dim=self.num_actor_obs,
             controller_state_dim=self.controller_state_dim,
@@ -80,7 +76,7 @@ class AdaptiveHIMActorCritic(nn.Module):
             loading_loss_weight=contact_estimator_loss_loading,
         )
 
-        # Baseline actor shape is kept exactly compatible: [57 + 3 + 16] -> 16.
+        # Baseline actor shape stays exactly checkpoint-compatible: 76 -> 16.
         baseline_input_dim = self.num_one_step_obs + 3 + 16
         actor_layers = [nn.Linear(baseline_input_dim, actor_hidden_dims[0]), act]
         for i in range(len(actor_hidden_dims)):
@@ -114,8 +110,6 @@ class AdaptiveHIMActorCritic(nn.Module):
             act,
             nn.Linear(64, self.num_compliance_actions),
         )
-
-        # Exact zero initial contribution from both new policy heads.
         nn.init.zeros_(self.motion_adapter[-1].weight)
         nn.init.zeros_(self.motion_adapter[-1].bias)
         nn.init.zeros_(self.compliance_head[-1].weight)
@@ -132,8 +126,6 @@ class AdaptiveHIMActorCritic(nn.Module):
                 ]
         self.critic = nn.Sequential(*critic_layers)
 
-        # Preserve baseline exploration on the first 16 dimensions but keep the
-        # new compliance exploration deliberately small.
         std = torch.ones(self.num_policy_actions) * float(init_noise_std)
         std[self.num_motion_actions :] = float(compliance_init_std)
         self.std = nn.Parameter(std)
@@ -178,8 +170,9 @@ class AdaptiveHIMActorCritic(nn.Module):
         motion_delta = self.motion_adapter(augmented)
         motion = base_motion + self.motion_adapter_scale * torch.tanh(motion_delta)
 
-        # Raw compliance action is centered at exactly zero initially. The env
-        # clips it to [0,1], so inference at initialization equals baseline.
+        # Raw compliance remains centered at zero. Environment maps negatives to
+        # alpha=0; deterministic baseline migration therefore starts with no
+        # compliance at all.
         compliance = self.compliance_head(augmented)
         mean = torch.cat((motion, compliance), dim=-1)
         self.last_contact_estimate = contact
@@ -187,7 +180,11 @@ class AdaptiveHIMActorCritic(nn.Module):
 
     def update_distribution(self, obs_history, controller_state):
         mean = self._policy_mean(obs_history, controller_state)
-        self.distribution = Normal(mean, mean * 0.0 + self.std)
+        # The upstream HIM implementation optimizes std directly. Clamp only at
+        # use time so the four small compliance std values cannot cross zero and
+        # create invalid/NaN Normal distributions during early adaptation.
+        safe_std = torch.clamp(self.std, min=1.0e-3)
+        self.distribution = Normal(mean, mean * 0.0 + safe_std)
 
     def act(self, obs_history, controller_state, **kwargs):
         self.update_distribution(obs_history, controller_state)
