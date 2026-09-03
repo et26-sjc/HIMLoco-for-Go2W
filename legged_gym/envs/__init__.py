@@ -10,6 +10,11 @@ from legged_gym.envs.mc.mc_100hz_config import MC100HzCfg, MC100HzCfgPPO
 from legged_gym.envs.mc.quiet_mc_config import QuietMCCfg, QuietMCCfgPPO
 from legged_gym.envs.mc.quiet_mc_100hz_config import QuietMC100HzCfg, QuietMC100HzCfgPPO
 from .mc.quiet_mc_robot import QuietMC
+from legged_gym.envs.mc.mc_learned_admittance_100hz_config import (
+    MCLearnedAdmittance100HzCfg,
+    MCLearnedAdmittance100HzCfgPPO,
+)
+from .mc.mc_learned_admittance_100hz_robot import MCLearnedAdmittance100Hz
 
 import os
 
@@ -20,3 +25,9 @@ task_registry.register("mc", MC, MCRoughCfg(), MCRoughCfgPPO())
 task_registry.register("mc_100hz", MC, MC100HzCfg(), MC100HzCfgPPO())
 task_registry.register("quiet_mc", QuietMC, QuietMCCfg(), QuietMCCfgPPO())
 task_registry.register("quiet_mc_100hz", QuietMC, QuietMC100HzCfg(), QuietMC100HzCfgPPO())
+task_registry.register(
+    "mc_learned_admittance_100hz",
+    MCLearnedAdmittance100Hz,
+    MCLearnedAdmittance100HzCfg(),
+    MCLearnedAdmittance100HzCfgPPO(),
+)
