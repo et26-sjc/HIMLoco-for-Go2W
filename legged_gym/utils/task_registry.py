@@ -116,6 +116,27 @@ class TaskRegistry():
             )
             print(f"Loading model from: {resume_path}")
             runner.load(resume_path)
+        else:
+            # Adaptive tasks can start from a separately trained locomotion
+            # baseline without reusing that run's optimizer or iteration count.
+            init_experiment_name = getattr(
+                train_cfg.runner, 'init_experiment_name', None
+            )
+            if init_experiment_name:
+                init_root = os.path.join(
+                    LEGGED_GYM_ROOT_DIR, 'logs', init_experiment_name
+                )
+                init_path = get_load_path(
+                    init_root,
+                    load_run=getattr(train_cfg.runner, 'init_load_run', -1),
+                    checkpoint=getattr(train_cfg.runner, 'init_checkpoint', -1),
+                )
+                print(f"Initializing adaptive policy from baseline: {init_path}")
+                runner.load(init_path, load_optimizer=False)
+                # This is a new adaptive experiment, not a continuation of the
+                # baseline iteration counter.
+                runner.current_learning_iteration = 0
+
         return runner, train_cfg
 
 
