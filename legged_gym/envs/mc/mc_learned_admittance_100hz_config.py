@@ -65,9 +65,15 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         contact_estimator_loss_force = 1.0
         contact_estimator_loss_loading = 0.5
         motion_adapter_scale = 0.05
-        # Keep initial compliance exploration small. At deterministic inference
-        # the zero-initialized compliance head gives exactly alpha=0.
         compliance_init_std = 0.05
+
+    class algorithm(MC100HzCfgPPO.algorithm):
+        # Stage-1 principle: preserve the already-good locomotion backbone.
+        # PPO updates critic + new adaptive policy heads, while the original
+        # 16-D actor and original HIM estimator stay fixed. A later joint-finetune
+        # experiment can set these to nonzero/True.
+        base_actor_lr_scale = 0.0
+        update_him_estimator = False
 
     class runner(MC100HzCfgPPO.runner):
         policy_class_name = "AdaptiveHIMActorCritic"
@@ -76,9 +82,6 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         experiment_name = "MC_LearnedAdmittance_100Hz"
         run_name = "sensorless_admittance_v1"
 
-        # Initialize the locomotion/HIM/critic tensors from the already trained
-        # 100 Hz baseline. The adaptive runner performs shape-aware migration and
-        # leaves new contact/compliance modules at their safe initialization.
         init_experiment_name = "MC_100Hz"
         init_load_run = -1
         init_checkpoint = -1
@@ -92,4 +95,5 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
             "sensorless-contact-estimator",
             "learned-admittance",
             "policy20-physical16",
+            "stage1-frozen-locomotion",
         ]
