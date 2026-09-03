@@ -1,8 +1,9 @@
-"""Deployable contact/impact estimator for learned MC admittance.
+"""Deployable axial contact/impact estimator for learned MC admittance.
 
 The estimator consumes only the original HIM proprioceptive history plus the
-12-D internal admittance state.  Simulator contact force is used only as the
-supervised target during training.
+12-D internal admittance state. Simulator contact force is used only as the
+supervised target during training. Outputs represent normalized per-leg axial
+compressive force and positive axial loading rate for the next policy interval.
 """
 
 import torch
@@ -25,6 +26,7 @@ class ContactEstimator(nn.Module):
         force_loss_weight=1.0,
         loading_loss_weight=0.5,
         max_grad_norm=10.0,
+        initial_output_bias=-3.0,
     ):
         super().__init__()
         if output_dim != 8:
@@ -36,7 +38,14 @@ class ContactEstimator(nn.Module):
         for hidden in hidden_dims:
             layers += [nn.Linear(input_dim, int(hidden)), act]
             input_dim = int(hidden)
-        layers += [nn.Linear(input_dim, int(output_dim))]
+        output_layer = nn.Linear(input_dim, int(output_dim))
+        # A random Softplus head centered around zero would initially predict
+        # Softplus(0)=0.693, i.e. ~69 N / 6.9 kN/s with the current SI scales.
+        # Start close to zero instead so baseline migration cannot accidentally
+        # activate admittance before the estimator has learned useful structure.
+        nn.init.zeros_(output_layer.weight)
+        nn.init.constant_(output_layer.bias, float(initial_output_bias))
+        layers += [output_layer]
         self.encoder = nn.Sequential(*layers)
 
         self.force_loss_weight = float(force_loss_weight)
@@ -47,8 +56,6 @@ class ContactEstimator(nn.Module):
 
     def _predict(self, obs_history, controller_state):
         x = torch.cat((obs_history.detach(), controller_state.detach()), dim=-1)
-        # Contact magnitude and positive loading rate are non-negative. Softplus
-        # avoids an estimator that spends capacity learning the sign constraint.
         return F.softplus(self.encoder(x))
 
     def forward(self, obs_history, controller_state):
