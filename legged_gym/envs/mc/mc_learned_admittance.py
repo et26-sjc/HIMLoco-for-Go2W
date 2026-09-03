@@ -10,10 +10,10 @@ Per leg, the virtual dynamics are
     M x_ddot + D(alpha) x_dot + K(alpha) x = alpha * g(dF) * F_transient
 
 where ``alpha`` is the extra RL compliance action in [0, 1], ``F_transient`` is
-computed from the *estimated* contact force after subtracting a slow support
-force baseline, and ``g(dF)`` is a smooth loading-rate gate. The resulting axial
-leg compression is mapped to HIP/KNEE target offsets through a damped
-least-squares Jacobian.
+computed from the estimated contact force after subtracting a slow support-force
+baseline, and ``g(dF)`` is a smooth loading-rate gate. The resulting axial leg
+compression is mapped to HIP/KNEE target offsets through a damped least-squares
+Jacobian.
 """
 
 import torch
@@ -68,12 +68,29 @@ class MCLearnedAdmittance:
         self.transient_force[env_ids] = 0.0
 
     def state(self):
-        """Deployable controller state exposed to the adaptive policy.
+        """Return the complete deployable internal controller state (16D).
 
-        Returns [delta_l(4), delta_l_dot(4), alpha(4)] = 12 dimensions. These are
-        controller-internal quantities and therefore remain available on hardware.
+        The actor/contact estimator should know every persistent state that can
+        change the admittance response. Values are normalized to comparable
+        magnitudes:
+
+        [compression/max_compression (4),
+         compression_velocity/max_velocity (4),
+         alpha (4),
+         support_force_bias/force_scale (4)].
+
+        No simulator-only quantity appears here; all four components exist inside
+        the low-level controller and are therefore reproducible on hardware.
         """
-        return torch.cat((self.delta_l, self.delta_l_dot, self.alpha), dim=-1)
+        compression = self.delta_l / max(self.max_compression, 1.0e-6)
+        compression_vel = self.delta_l_dot / max(
+            self.max_compression_vel, 1.0e-6
+        )
+        force_bias = self.force_bias / max(self.force_scale, 1.0e-6)
+        force_bias = torch.clamp(force_bias, 0.0, 5.0)
+        return torch.cat(
+            (compression, compression_vel, self.alpha, force_bias), dim=-1
+        )
 
     def _decode_contact_estimate(self, estimated_contact):
         if estimated_contact.shape[-1] != 8:
@@ -142,7 +159,6 @@ class MCLearnedAdmittance:
                 f"Expected 4-D compliance action, got {tuple(compliance_action.shape)}"
             )
 
-        # Zero compliance reproduces the original HIMLoco controller exactly.
         alpha = torch.clamp(compliance_action, 0.0, 1.0)
         force, loading_rate = self._decode_contact_estimate(estimated_contact)
 
