@@ -7,7 +7,7 @@ The environment separates three information domains explicitly:
 * policy-only extra action: four compliance activations;
 * training-only ground-truth impact signals from Isaac Gym contact tensors.
 
-The physical admittance never reads ground-truth contact force.  It is driven
+The physical admittance never reads ground-truth contact force. It is driven
 only by the contact estimator output supplied by the policy/runner.
 """
 
@@ -23,7 +23,6 @@ class MCLearnedAdmittance100Hz(MC):
     """MC with 20-D policy action but unchanged 16-D physical actuation."""
 
     _LEG_SPECS = [
-        # semantic leg, foot body, hip joint, knee joint
         ("FL", "FL_FOOT_LINK", "FBL_HIP_JOINT", "FBL_KNEE_JOINT"),
         ("FR", "FR_FOOT_LINK", "FAR_HIP_JOINT", "FAR_KNEE_JOINT"),
         ("RR", "RR_FOOT_LINK", "RAR_HIP_JOINT", "RAR_KNEE_JOINT"),
@@ -32,7 +31,6 @@ class MCLearnedAdmittance100Hz(MC):
 
     def _init_buffers(self):
         super()._init_buffers()
-
         self.num_motion_actions = int(self.cfg.env.num_motion_actions)
         self.num_compliance_actions = int(self.cfg.env.num_compliance_actions)
         self.num_policy_actions = int(self.cfg.env.num_policy_actions)
@@ -67,15 +65,9 @@ class MCLearnedAdmittance100Hz(MC):
             hip_ids.append(hip_id)
             knee_ids.append(knee_id)
 
-        self.adm_feet_indices = torch.tensor(
-            foot_ids, dtype=torch.long, device=self.device
-        )
-        self.adm_hip_indices = torch.tensor(
-            hip_ids, dtype=torch.long, device=self.device
-        )
-        self.adm_knee_indices = torch.tensor(
-            knee_ids, dtype=torch.long, device=self.device
-        )
+        self.adm_feet_indices = torch.tensor(foot_ids, dtype=torch.long, device=self.device)
+        self.adm_hip_indices = torch.tensor(hip_ids, dtype=torch.long, device=self.device)
+        self.adm_knee_indices = torch.tensor(knee_ids, dtype=torch.long, device=self.device)
 
         print("### Learned-admittance leg order:")
         for i, spec in enumerate(self._LEG_SPECS):
@@ -87,7 +79,6 @@ class MCLearnedAdmittance100Hz(MC):
         self.admittance = MCLearnedAdmittance(
             self.cfg.learned_admittance, self.num_envs, self.device
         )
-
         self.policy_actions = torch.zeros(
             self.num_envs, self.num_policy_actions, device=self.device
         )
@@ -98,8 +89,6 @@ class MCLearnedAdmittance100Hz(MC):
             self.num_envs, self.contact_estimate_dim, device=self.device
         )
 
-        # Training-only, 200 Hz impact target buffers. These are never returned as
-        # actor observations and never used by the deployed admittance controller.
         shape = (self.num_envs, 4)
         self.gt_step_peak_force = torch.zeros(shape, device=self.device)
         self.gt_step_peak_loading_rate = torch.zeros(shape, device=self.device)
@@ -108,6 +97,9 @@ class MCLearnedAdmittance100Hz(MC):
         self.gt_prev_base_vel_z = self._base_vel_z().clone()
         self.contact_estimator_target = torch.zeros(
             self.num_envs, self.contact_estimate_dim, device=self.device
+        )
+        self.transition_contact_estimator_target = torch.zeros_like(
+            self.contact_estimator_target
         )
 
     def _base_vel_z(self):
@@ -125,8 +117,8 @@ class MCLearnedAdmittance100Hz(MC):
         return state
 
     def get_contact_estimator_target(self):
-        """Return normalized training-only [peak F(4), peak positive dF(4)]."""
-        return self.contact_estimator_target
+        """Return the transition target even if envs reset inside post-step."""
+        return self.transition_contact_estimator_target
 
     def _begin_gt_impact_step(self):
         self.gt_step_peak_force.zero_()
@@ -143,14 +135,10 @@ class MCLearnedAdmittance100Hz(MC):
         self.gt_prev_force_norm.copy_(force_norm)
 
         base_vel_z = self._base_vel_z()
-        base_acc = torch.abs(
-            (base_vel_z - self.gt_prev_base_vel_z) / physics_dt
-        )
+        base_acc = torch.abs((base_vel_z - self.gt_prev_base_vel_z) / physics_dt)
         self.gt_prev_base_vel_z.copy_(base_vel_z)
 
-        self.gt_step_peak_force = torch.maximum(
-            self.gt_step_peak_force, force_norm
-        )
+        self.gt_step_peak_force = torch.maximum(self.gt_step_peak_force, force_norm)
         self.gt_step_peak_loading_rate = torch.maximum(
             self.gt_step_peak_loading_rate, loading_rate
         )
@@ -161,9 +149,8 @@ class MCLearnedAdmittance100Hz(MC):
     def _finish_gt_impact_step(self):
         cfg = self.cfg.learned_admittance
         force = self.gt_step_peak_force / float(cfg.contact_force_scale_n)
-        loading = (
-            self.gt_step_peak_loading_rate
-            / float(cfg.contact_loading_rate_scale_nps)
+        loading = self.gt_step_peak_loading_rate / float(
+            cfg.contact_loading_rate_scale_nps
         )
         clip = float(cfg.contact_target_clip)
         self.contact_estimator_target = torch.cat(
@@ -173,8 +160,6 @@ class MCLearnedAdmittance100Hz(MC):
 
     def _split_policy_action(self, policy_actions):
         if policy_actions.shape[-1] == self.num_motion_actions:
-            # BaseTask.reset() still supplies the legacy 16-D zero action. Treat
-            # it as an exact baseline reset with compliance disabled.
             compliance = torch.zeros(
                 policy_actions.shape[0],
                 self.num_compliance_actions,
@@ -185,8 +170,7 @@ class MCLearnedAdmittance100Hz(MC):
         if policy_actions.shape[-1] != self.num_policy_actions:
             raise RuntimeError(
                 f"Expected {self.num_policy_actions} policy actions or legacy "
-                f"{self.num_motion_actions} reset actions, got "
-                f"{policy_actions.shape[-1]}"
+                f"{self.num_motion_actions} reset actions, got {policy_actions.shape[-1]}"
             )
         return (
             policy_actions[:, : self.num_motion_actions],
@@ -212,7 +196,6 @@ class MCLearnedAdmittance100Hz(MC):
         q_target[:, self.adm_hip_indices] += offsets[:, :, 0]
         q_target[:, self.adm_knee_indices] += offsets[:, :, 1]
 
-        # Compliance must never bypass the existing joint safety envelope.
         for indices in (self.adm_hip_indices, self.adm_knee_indices):
             q_target[:, indices] = torch.maximum(
                 torch.minimum(
@@ -224,17 +207,14 @@ class MCLearnedAdmittance100Hz(MC):
 
         pos_err = q_target - self.dof_pos
         pos_err[:, self.wheel_indices] = 0.0
-
         vel_ref = torch.zeros_like(actions_scaled)
         vel_tmp = motion_actions * self.cfg.control.vel_scale
         vel_ref[:, self.wheel_indices] = vel_tmp[:, self.wheel_indices]
 
         if self.cfg.control.control_type != "P":
             raise RuntimeError(
-                "Learned admittance v1 is defined around the MC fixed-PD "
-                "controller and currently requires control_type='P'."
+                "Learned admittance v1 currently requires control_type='P'."
             )
-
         torques = (
             self.p_gains * self.Kp_factors * pos_err
             + self.d_gains * self.Kd_factors * (vel_ref - self.dof_vel)
@@ -243,19 +223,17 @@ class MCLearnedAdmittance100Hz(MC):
 
     def step(self, policy_actions, contact_estimate=None):
         """Execute a 20-D policy action while physically actuating only 16 DOFs."""
-        motion_actions, compliance_actions = self._split_policy_action(
-            policy_actions
-        )
-
+        motion_actions, compliance_actions = self._split_policy_action(policy_actions)
         clip_actions = self.cfg.normalization.clip_actions
-        self.policy_actions = torch.clip(
-            policy_actions, -clip_actions, clip_actions
-        ).to(self.device)
-        self.actions = torch.clip(
-            motion_actions, -clip_actions, clip_actions
-        ).to(self.device)
+        self.actions = torch.clip(motion_actions, -clip_actions, clip_actions).to(
+            self.device
+        )
         self.compliance_actions = torch.clamp(
             compliance_actions.to(self.device), 0.0, 1.0
+        )
+        # Always keep this cache 20-D, including BaseTask.reset's legacy 16-D call.
+        self.policy_actions = torch.cat(
+            (self.actions, self.compliance_actions), dim=-1
         )
 
         if contact_estimate is None:
@@ -268,9 +246,6 @@ class MCLearnedAdmittance100Hz(MC):
                 )
             self.estimated_contact.copy_(contact_estimate.to(self.device))
 
-        # Preserve the exact baseline motor-delay path for the original 16D
-        # motion action. Compliance is a supervisory outer-loop command and is
-        # held over the two 200 Hz physics substeps of each 100 Hz policy step.
         self.delayed_actions = self.actions.clone().view(
             self.num_envs, 1, self.num_actions
         ).repeat(1, self.cfg.control.decimation, 1)
@@ -304,6 +279,11 @@ class MCLearnedAdmittance100Hz(MC):
             self._update_gt_impact_substep()
 
         self._finish_gt_impact_step()
+        # post_physics_step may reset some envs; preserve the target generated by
+        # this transition before that reset occurs.
+        self.transition_contact_estimator_target.copy_(
+            self.contact_estimator_target
+        )
         termination_ids, termination_privileged_obs = self.post_physics_step()
 
         clip_obs = self.cfg.normalization.clip_observations
@@ -337,10 +317,6 @@ class MCLearnedAdmittance100Hz(MC):
         self.contact_estimator_target[env_ids] = 0.0
         self.gt_prev_base_vel_z[env_ids] = self._base_vel_z()[env_ids]
 
-    # ------------------------------------------------------------------
-    # Training-only quiet rewards. All use simulator truth, but none enter
-    # inference observations. Values are normalized so reward scales are stable.
-    # ------------------------------------------------------------------
     def _reward_quiet_impact_force(self):
         cfg = self.cfg.quiet_training
         excess = torch.clamp(
@@ -351,8 +327,7 @@ class MCLearnedAdmittance100Hz(MC):
     def _reward_quiet_loading_rate(self):
         cfg = self.cfg.quiet_training
         excess = torch.clamp(
-            self.gt_step_peak_loading_rate
-            - float(cfg.loading_rate_threshold_nps),
+            self.gt_step_peak_loading_rate - float(cfg.loading_rate_threshold_nps),
             min=0.0,
         ) / float(cfg.loading_rate_normalizer_nps)
         return torch.mean(excess, dim=1)
