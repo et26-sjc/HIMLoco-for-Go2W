@@ -103,6 +103,39 @@ class AdaptiveHIMOnPolicyRunner:
             save_code=True,
         )
 
+    @staticmethod
+    def _accumulate_diagnostics(sums, counts, maxima, diagnostics):
+        for key, value in diagnostics.items():
+            value = value.detach()
+            if (
+                key.endswith("_max")
+                or key.endswith("_max_n")
+                or key.endswith("_max_nps")
+                or key.endswith("_max_mps2")
+                or key.endswith("_max_rad")
+                or key.endswith("_max_mm")
+            ):
+                if key not in maxima:
+                    maxima[key] = value.clone()
+                else:
+                    maxima[key] = torch.maximum(maxima[key], value)
+            else:
+                if key not in sums:
+                    sums[key] = value.clone()
+                    counts[key] = 1
+                else:
+                    sums[key] = sums[key] + value
+                    counts[key] += 1
+
+    @staticmethod
+    def _finalize_diagnostics(sums, counts, maxima):
+        result = {}
+        for key, value in sums.items():
+            result[key] = (value / max(counts[key], 1)).item()
+        for key, value in maxima.items():
+            result[key] = value.item()
+        return result
+
     def _contact_pretrain(self, obs, controller_state, critic_obs):
         """Stage 0: train only ContactEstimator under exact baseline motion."""
         num_steps = int(self.cfg.get("contact_pretrain_steps", 0))
@@ -175,9 +208,6 @@ class AdaptiveHIMOnPolicyRunner:
                     self.writer.add_scalar(
                         "Warmup/contact_loading_loss", avg_loading, step + 1
                     )
-                # Do not write warm-up samples with explicit W&B steps: PPO uses
-                # iteration numbers beginning at zero, so mixing those two step
-                # domains would create non-monotonic W&B histories.
                 running_force = 0.0
                 running_loading = 0.0
                 window_count = 0
@@ -222,9 +252,13 @@ class AdaptiveHIMOnPolicyRunner:
         cur_reward_sum = torch.zeros(self.env.num_envs, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, device=self.device)
 
-        tot_iter = self.current_learning_iteration + num_learning_iterations
-        for it in range(self.current_learning_iteration, tot_iter):
+        start_iter = self.current_learning_iteration
+        tot_iter = start_iter + num_learning_iterations
+        for it in range(start_iter, tot_iter):
             start = time.time()
+            diagnostic_sums = {}
+            diagnostic_counts = {}
+            diagnostic_maxima = {}
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     actions, contact_estimate = self.alg.act(
@@ -239,6 +273,13 @@ class AdaptiveHIMOnPolicyRunner:
                         termination_ids,
                         termination_privileged_obs,
                     ) = self.env.step(actions, contact_estimate)
+
+                    self._accumulate_diagnostics(
+                        diagnostic_sums,
+                        diagnostic_counts,
+                        diagnostic_maxima,
+                        self.env.get_admittance_diagnostics(),
+                    )
 
                     next_obs = next_obs.to(self.device)
                     rewards = rewards.to(self.device)
@@ -295,8 +336,13 @@ class AdaptiveHIMOnPolicyRunner:
                 start_learn = time.time()
                 self.alg.compute_returns(critic_obs)
 
+            diagnostics = self._finalize_diagnostics(
+                diagnostic_sums, diagnostic_counts, diagnostic_maxima
+            )
             losses = self.alg.update()
             learn_time = time.time() - start_learn
+            self.current_learning_iteration = it + 1
+
             if self.log_dir is not None:
                 self.log(
                     it,
@@ -306,12 +352,17 @@ class AdaptiveHIMOnPolicyRunner:
                     ep_infos,
                     rewbuffer,
                     lenbuffer,
+                    diagnostics,
                 )
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            if self.current_learning_iteration % self.save_interval == 0:
+                self.save(
+                    os.path.join(
+                        self.log_dir,
+                        f"model_{self.current_learning_iteration}.pt",
+                    )
+                )
             ep_infos.clear()
 
-        self.current_learning_iteration += num_learning_iterations
         self.save(
             os.path.join(
                 self.log_dir, f"model_{self.current_learning_iteration}.pt"
@@ -330,6 +381,7 @@ class AdaptiveHIMOnPolicyRunner:
         ep_infos,
         rewbuffer,
         lenbuffer,
+        diagnostics,
     ):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         iteration_time = collection_time + learn_time
@@ -344,7 +396,11 @@ class AdaptiveHIMOnPolicyRunner:
             "Loss/contact_loading": losses["contact_loading"],
             "Loss/learning_rate": self.alg.learning_rate,
             "Policy/mean_noise_std": self.actor_critic.std.mean().item(),
+            "Policy/compliance_noise_std": self.actor_critic.std[
+                self.env.num_actions :
+            ].mean().item(),
         }
+        metrics.update(diagnostics)
         if len(rewbuffer) > 0:
             metrics["Train/mean_reward"] = statistics.mean(rewbuffer)
             metrics["Train/mean_episode_length"] = statistics.mean(lenbuffer)
@@ -377,6 +433,9 @@ class AdaptiveHIMOnPolicyRunner:
             f"{metrics.get('Train/mean_reward', float('nan')):.3f} "
             f"contact_F={losses['contact_force']:.4f} "
             f"contact_dF={losses['contact_loading']:.4f} "
+            f"alpha={metrics.get('Admittance/alpha_mean', float('nan')):.3f} "
+            f"comp_p95={metrics.get('Admittance/compression_p95_mm', float('nan')):.2f}mm "
+            f"F_mae={metrics.get('Estimator/axial_force_mae_n', float('nan')):.1f}N "
             f"time={iteration_time:.2f}s"
         )
 
@@ -392,6 +451,8 @@ class AdaptiveHIMOnPolicyRunner:
                     self.actor_critic.contact_estimator.optimizer.state_dict()
                 ),
                 "iter": self.current_learning_iteration,
+                "tot_timesteps": self.tot_timesteps,
+                "tot_time": self.tot_time,
                 "contact_warmup_done": self.contact_warmup_done,
                 "infos": infos,
             },
@@ -405,8 +466,6 @@ class AdaptiveHIMOnPolicyRunner:
 
         if is_adaptive:
             self.actor_critic.load_state_dict(incoming)
-            # Older adaptive checkpoints did not save this flag; if they already
-            # contain a ContactEstimator, default to not repeating warm-up.
             self.contact_warmup_done = bool(
                 loaded.get("contact_warmup_done", True)
             )
@@ -442,6 +501,21 @@ class AdaptiveHIMOnPolicyRunner:
             load_optimizer = False
 
         self.current_learning_iteration = int(loaded.get("iter", 0))
+        if is_adaptive:
+            self.tot_timesteps = int(
+                loaded.get(
+                    "tot_timesteps",
+                    self.current_learning_iteration
+                    * self.num_steps_per_env
+                    * self.env.num_envs,
+                )
+            )
+            self.tot_time = float(loaded.get("tot_time", 0.0))
+            print(
+                f"Resumed adaptive checkpoint at iteration "
+                f"{self.current_learning_iteration}; contact warmup done="
+                f"{self.contact_warmup_done}."
+            )
         return loaded.get("infos", None)
 
     def get_inference_policy(self, device=None):
