@@ -10,10 +10,10 @@ Per leg, the virtual dynamics are
     M x_ddot + D(alpha) x_dot + K(alpha) x = alpha * g(dF) * F_transient
 
 where ``alpha`` is the extra RL compliance action in [0, 1], ``F_transient`` is
-computed from the estimated contact force after subtracting a slow support-force
-baseline, and ``g(dF)`` is a smooth loading-rate gate. The resulting axial leg
-compression is mapped to HIP/KNEE target offsets through a damped least-squares
-Jacobian.
+computed from the *estimated* contact force after subtracting a slow support
+force baseline, and ``g(dF)`` is a smooth loading-rate gate. The resulting
+axial leg compression is mapped to HIP/KNEE target offsets through a damped
+least-squares Jacobian.
 """
 
 import torch
@@ -56,6 +56,16 @@ class MCLearnedAdmittance:
         self.estimated_loading_rate = torch.zeros_like(self.delta_l)
         self.transient_force = torch.zeros_like(self.delta_l)
 
+        # Diagnostic-only mirrors of intermediate controller variables. They do
+        # not enter state() and therefore do not change the deployed information
+        # flow or the policy observation dimensionality.
+        self.loading_gate = torch.zeros_like(self.delta_l)
+        self.drive_force = torch.zeros_like(self.delta_l)
+        self.stiffness = torch.full_like(self.delta_l, self.k_max)
+        self.last_joint_offsets = torch.zeros(
+            self.num_envs, self.num_legs, 2, device=device
+        )
+
     def reset(self, env_ids):
         if len(env_ids) == 0:
             return
@@ -66,6 +76,10 @@ class MCLearnedAdmittance:
         self.estimated_force[env_ids] = 0.0
         self.estimated_loading_rate[env_ids] = 0.0
         self.transient_force[env_ids] = 0.0
+        self.loading_gate[env_ids] = 0.0
+        self.drive_force[env_ids] = 0.0
+        self.stiffness[env_ids] = self.k_max
+        self.last_joint_offsets[env_ids] = 0.0
 
     def state(self):
         """Return the complete deployable internal controller state (16D).
@@ -202,11 +216,17 @@ class MCLearnedAdmittance:
             self.delta_l_dot,
         )
 
+        offsets = self._joint_offsets_from_compression(
+            q_nom, hip_indices, knee_indices
+        )
+
         self.alpha.copy_(alpha)
         self.estimated_force.copy_(force)
         self.estimated_loading_rate.copy_(loading_rate)
         self.transient_force.copy_(transient)
+        self.loading_gate.copy_(gate)
+        self.drive_force.copy_(drive)
+        self.stiffness.copy_(stiffness)
+        self.last_joint_offsets.copy_(offsets)
 
-        return self._joint_offsets_from_compression(
-            q_nom, hip_indices, knee_indices
-        )
+        return offsets
