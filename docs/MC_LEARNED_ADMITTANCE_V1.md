@@ -30,10 +30,11 @@ Isaac Gym ground-truth contact force may be used only for:
 - ContactEstimator supervision;
 - quiet-impact rewards;
 - critic privileged information already present in the MC baseline;
-- offline/evaluation metrics.
+- offline/evaluation metrics and diagnostic logging.
 
 Ground-truth contact force MUST NOT enter actor input or the deployed admittance
-controller.
+controller. Raw W&B diagnostics are cached before episode reset but never fed
+back into observations, rewards, actor, critic or estimator inputs.
 
 ## 2. Dimensions
 
@@ -130,11 +131,17 @@ samples while the physical behavior remains the original baseline.
 - motion-adapter scale = 0;
 - policy std frozen;
 - first 16 std values are migrated from the baseline checkpoint;
-- four new compliance std values remain fixed at 0.05;
+- four new compliance std values remain fixed at **0.15**;
 - ContactEstimator continues supervised learning at its own independent LR;
 - PPO trains the 4D compliance head and critic;
 - all original HIMLoco rewards remain active, with added impact/loading/base-acc
   and compliance-usage penalties.
+
+The earlier 0.05 compliance exploration was too conservative: after negative
+samples were clipped to zero, the virtual admittance rarely experienced a
+measurable physical response. 0.15 is still bounded by the same 20 mm maximum
+compression, 0.15 m/s compression velocity, 0.20 rad joint offset and joint
+limits.
 
 This stage asks a deliberately clean question:
 
@@ -148,26 +155,84 @@ adapter (e.g. scale 0.05) and/or a very small baseline-actor LR. This tests
 whether compensating the nominal motion for controller-induced leg shortening
 adds value without conflating the primary compliance result.
 
-## 7. Training
+## 7. Raw diagnostics
+
+The adaptive environment caches diagnostics before `post_physics_step()` and
+`reset_idx()`, so terminal transitions are not incorrectly reported as zero.
+The runner aggregates these values over every 48-step PPO rollout and logs them
+to TensorBoard/W&B without feeding them back to the policy.
+
+Important groups include:
+
+```text
+Admittance/alpha_mean, alpha_p95, alpha_max, alpha_active_ratio
+Admittance/compression_mean_mm, compression_p95_mm, compression_max_mm
+Admittance/gate_mean, gate_active_ratio
+Admittance/transient_force_mean_n, drive_force_mean_n
+Admittance/stiffness_mean_npm, support_bias_mean_n
+Admittance/joint_offset_abs_mean_rad / max_rad
+
+Estimator/axial_force_pred_mean_n / gt_mean_n / mae_n
+Estimator/loading_pred_mean_nps / gt_mean_nps / mae_nps
+Estimator/force_target_clip_ratio / loading_target_clip_ratio
+
+Impact/gt_3d_force_peak_mean_n / max_n
+Impact/gt_3d_loading_peak_mean_nps / max_nps
+Impact/gt_base_acc_peak_mean_mps2 / max_mps2
+```
+
+The console summary also prints `alpha`, compression p95 and axial-force MAE.
+
+## 8. Training and resume
 
 A trained baseline must exist under `logs/MC_100Hz` unless the initializer
 configuration is changed.
 
-```bash
-python legged_gym/scripts/train.py \
-  --task=mc_learned_admittance_100hz \
-  --headless
-```
-
-Recommended first smoke run:
+Fresh 64-env diagnostic run:
 
 ```bash
 python legged_gym/scripts/train.py \
   --task=mc_learned_admittance_100hz \
   --num_envs=64 \
-  --max_iterations=20 \
+  --max_iterations=100 \
   --headless
 ```
+
+The training entrypoint now preserves `--resume`; it no longer forces
+`args.resume=False`. Adaptive checkpoints save the correct current iteration,
+total timesteps, elapsed training time and the `contact_warmup_done` flag.
+Therefore Stage-0 warm-up is not repeated when resuming an adaptive checkpoint.
+
+Resume the latest adaptive run for additional iterations:
+
+```bash
+python legged_gym/scripts/train.py \
+  --task=mc_learned_admittance_100hz \
+  --resume \
+  --num_envs=64 \
+  --max_iterations=50 \
+  --headless
+```
+
+Or resume an explicit run/checkpoint:
+
+```bash
+python legged_gym/scripts/train.py \
+  --task=mc_learned_admittance_100hz \
+  --resume \
+  --load_run=<adaptive-run-directory-name> \
+  --checkpoint=50 \
+  --num_envs=64 \
+  --max_iterations=50 \
+  --headless
+```
+
+For this runner, `--max_iterations=50` on resume means **50 additional PPO
+iterations** after the loaded checkpoint.
+
+Do not resume the earlier 0.05-exploration smoke checkpoint when evaluating the
+new 0.15 setting: start a fresh adaptive run from `MC_100Hz` so the four
+compliance std values initialize to 0.15.
 
 Before a long run verify:
 
@@ -175,14 +240,14 @@ Before a long run verify:
 2. physical action=16 and policy action=20;
 3. controller state=16 and contact estimate=8;
 4. baseline actor/HIM/critic and first 16 std values migrate successfully;
-5. deterministic compliance begins at zero;
+5. W&B reports `Policy/compliance_noise_std` close to 0.15 in a fresh run;
 6. warm-up executes baseline motion with alpha forced to zero;
 7. contact force/loading losses decrease during warm-up;
 8. Stage-1 baseline motion output remains identical to the loaded checkpoint;
-9. compliance remains sparse on flat terrain and increases around stair impacts;
+9. `alpha_p95`, `compression_p95_mm`, gate and transient force are nonzero around impacts;
 10. velocity/yaw tracking remains near baseline while force/loading/base-acc fall.
 
-## 8. Evaluation and deployment status
+## 9. Evaluation and deployment status
 
 The existing `QuietMC` physics-rate metrics remain the authoritative final
 silent-locomotion evaluator. The adaptive environment already computes training
@@ -203,7 +268,7 @@ state, execute the same second-order dynamics/Jacobian mapping, and consume the
 JIT ContactEstimator output. MuJoCo/real contact force must never be used as a
 controller input.
 
-## 9. Research note on prediction horizon
+## 10. Research note on prediction horizon
 
 The estimator predicts impact over the upcoming 10 ms policy transition. The
 target is therefore partly action-dependent. Stage 1 intentionally fixes the
