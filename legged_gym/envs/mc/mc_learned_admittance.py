@@ -7,14 +7,17 @@ MuJoCo and on hardware without a force sensor.
 
 Per leg, the virtual dynamics are
 
-    M x_ddot + D(alpha) x_dot + K(alpha) x = alpha * g(dF) * F_transient
+    M x_ddot + D(beta) x_dot + K(beta) x = beta * g(dF) * F_transient
 
-where ``alpha`` is the extra RL compliance action in [0, 1], ``F_transient`` is
-computed from the *estimated* contact force after subtracting a slow support
-force baseline, and ``g(dF)`` is a smooth loading-rate gate. The resulting
-axial leg compression is mapped to HIP/KNEE target offsets through a damped
-least-squares Jacobian.
+where ``alpha`` is the extra RL compliance action in [0, 1] and ``beta`` is a
+concave, zero-preserving authority mapping of alpha. ``F_transient`` is computed
+from the *estimated* contact force after subtracting a slow support-force
+baseline, and ``g(dF)`` is a smooth loading-rate gate. The resulting axial leg
+compression is mapped to HIP/KNEE target offsets through a damped least-squares
+Jacobian.
 """
+
+import math
 
 import torch
 
@@ -31,6 +34,9 @@ class MCLearnedAdmittance:
         self.zeta = float(cfg.damping_ratio)
         self.k_min = float(cfg.min_stiffness_n_per_m)
         self.k_max = float(cfg.max_stiffness_n_per_m)
+        self.activation_gain = float(
+            getattr(cfg, "compliance_activation_gain", 1.0)
+        )
         self.force_bias_tau = float(cfg.force_bias_time_constant_s)
         self.force_deadband = float(cfg.force_deadband_n)
         self.force_scale = float(cfg.contact_force_scale_n)
@@ -52,6 +58,7 @@ class MCLearnedAdmittance:
         self.delta_l_dot = torch.zeros_like(self.delta_l)
         self.force_bias = torch.zeros_like(self.delta_l)
         self.alpha = torch.zeros_like(self.delta_l)
+        self.effective_alpha = torch.zeros_like(self.delta_l)
         self.estimated_force = torch.zeros_like(self.delta_l)
         self.estimated_loading_rate = torch.zeros_like(self.delta_l)
         self.transient_force = torch.zeros_like(self.delta_l)
@@ -73,6 +80,7 @@ class MCLearnedAdmittance:
         self.delta_l_dot[env_ids] = 0.0
         self.force_bias[env_ids] = 0.0
         self.alpha[env_ids] = 0.0
+        self.effective_alpha[env_ids] = 0.0
         self.estimated_force[env_ids] = 0.0
         self.estimated_loading_rate[env_ids] = 0.0
         self.transient_force[env_ids] = 0.0
@@ -90,11 +98,11 @@ class MCLearnedAdmittance:
 
         [compression/max_compression (4),
          compression_velocity/max_velocity (4),
-         alpha (4),
+         raw alpha (4),
          support_force_bias/force_scale (4)].
 
-        No simulator-only quantity appears here; all four components exist inside
-        the low-level controller and are therefore reproducible on hardware.
+        ``effective_alpha`` is a deterministic mapping of raw alpha and therefore
+        does not need an additional state channel.
         """
         compression = self.delta_l / max(self.max_compression, 1.0e-6)
         compression_vel = self.delta_l_dot / max(
@@ -124,6 +132,20 @@ class MCLearnedAdmittance:
         return torch.sigmoid(
             (loading_rate - self.loading_rate_threshold) / softness
         )
+
+    def _effective_compliance(self, alpha):
+        """Map raw RL intent to physical authority without changing endpoints.
+
+        beta = (1 - exp(-k*alpha)) / (1 - exp(-k))
+
+        The mapping is concave for k>0, so small non-zero policy actions create
+        a measurable physical response. beta(0)=0 keeps exact baseline
+        equivalence and beta(1)=1 preserves the configured safety limits.
+        """
+        gain = max(self.activation_gain, 1.0e-6)
+        normalizer = max(1.0 - math.exp(-gain), 1.0e-6)
+        beta = -torch.expm1(-gain * alpha) / normalizer
+        return torch.clamp(beta, 0.0, 1.0)
 
     def _joint_offsets_from_compression(self, q_nom, hip_indices, knee_indices):
         qh = q_nom[:, hip_indices]
@@ -174,6 +196,7 @@ class MCLearnedAdmittance:
             )
 
         alpha = torch.clamp(compliance_action, 0.0, 1.0)
+        beta = self._effective_compliance(alpha)
         force, loading_rate = self._decode_contact_estimate(estimated_contact)
 
         gate = self._loading_gate(loading_rate)
@@ -187,13 +210,13 @@ class MCLearnedAdmittance:
             max=self.max_force_input,
         )
 
-        stiffness = self.k_max - alpha * (self.k_max - self.k_min)
+        stiffness = self.k_max - beta * (self.k_max - self.k_min)
         stiffness = torch.clamp(stiffness, min=self.k_min, max=self.k_max)
         damping = 2.0 * self.zeta * torch.sqrt(
             torch.clamp(self.mass * stiffness, min=1.0e-6)
         )
 
-        drive = alpha * gate * transient
+        drive = beta * gate * transient
         delta_l_ddot = (
             drive - damping * self.delta_l_dot - stiffness * self.delta_l
         ) / self.mass
@@ -221,6 +244,7 @@ class MCLearnedAdmittance:
         )
 
         self.alpha.copy_(alpha)
+        self.effective_alpha.copy_(beta)
         self.estimated_force.copy_(force)
         self.estimated_loading_rate.copy_(loading_rate)
         self.transient_force.copy_(transient)
