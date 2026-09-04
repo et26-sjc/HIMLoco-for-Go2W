@@ -28,6 +28,13 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
         min_stiffness_n_per_m = 2500.0
         max_stiffness_n_per_m = 8000.0
 
+        # Raw RL alpha stays in [0, 1], but a concave authority mapping gives
+        # small non-zero compliance intents enough physical authority to be
+        # observable during Stage-1 learning while preserving alpha=0 -> exact
+        # baseline behaviour:
+        #     beta = 1 - exp(-gain * alpha)
+        compliance_activation_gain = 6.0
+
         force_bias_time_constant_s = 0.10
         force_deadband_n = 10.0
         loading_rate_gate_nps = 5000.0
@@ -42,10 +49,12 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
         lower_leg_length_m = 0.22
         jacobian_damping = 0.02
 
-        # Diagnostic thresholds only.  These values are never fed back into the
+        # Diagnostic thresholds only. These values are never fed back into the
         # actor/critic/reward path; they only define W&B summary counters.
         diagnostic_alpha_active_threshold = 0.05
         diagnostic_gate_active_threshold = 0.50
+        diagnostic_force_event_threshold_n = 60.0
+        diagnostic_loading_event_threshold_nps = 5000.0
 
     class quiet_training:
         force_threshold_n = 60.0
@@ -109,5 +118,6 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
             "stage1-frozen-locomotion",
             "stage1-compliance-only",
             "compliance-std-0.15",
+            "effective-alpha-gain-6",
             "raw-admittance-diagnostics",
         ]
