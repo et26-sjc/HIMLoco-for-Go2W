@@ -42,6 +42,11 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
         lower_leg_length_m = 0.22
         jacobian_damping = 0.02
 
+        # Diagnostic thresholds only.  These values are never fed back into the
+        # actor/critic/reward path; they only define W&B summary counters.
+        diagnostic_alpha_active_threshold = 0.05
+        diagnostic_gate_active_threshold = 0.50
+
     class quiet_training:
         force_threshold_n = 60.0
         force_normalizer_n = 100.0
@@ -65,11 +70,14 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         contact_estimator_loss_force = 1.0
         contact_estimator_loss_loading = 0.5
         motion_adapter_scale = 0.0
-        compliance_init_std = 0.05
+        # 0.05 was too conservative: after clipping negative samples to zero the
+        # admittance almost never experienced a physically meaningful response.
+        # 0.15 keeps Stage-1 exploration small while making compliance observable.
+        compliance_init_std = 0.15
 
     class algorithm(MC100HzCfgPPO.algorithm):
         # Stage 1 freezes every baseline-policy degree of freedom. The four new
-        # compliance dimensions use a fixed small exploration std=0.05.
+        # compliance dimensions use a fixed small exploration std=0.15.
         base_actor_lr_scale = 0.0
         action_std_lr_scale = 0.0
         update_him_estimator = False
@@ -100,4 +108,6 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
             "stage0-contact-warmup",
             "stage1-frozen-locomotion",
             "stage1-compliance-only",
+            "compliance-std-0.15",
+            "raw-admittance-diagnostics",
         ]
