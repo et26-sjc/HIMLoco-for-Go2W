@@ -150,9 +150,36 @@ class MCLearnedAdmittance100Hz(MC):
             return torch.zeros((), device=x.device, dtype=x.dtype)
         return torch.quantile(flat, 0.95)
 
+    @staticmethod
+    def _pearson_corr(x, y):
+        x = x.reshape(-1).float()
+        y = y.reshape(-1).float()
+        if x.numel() == 0:
+            return torch.zeros((), device=x.device, dtype=x.dtype)
+        x = x - torch.mean(x)
+        y = y - torch.mean(y)
+        denom = torch.sqrt(torch.sum(x * x) * torch.sum(y * y))
+        corr = torch.sum(x * y) / torch.clamp(denom, min=1.0e-8)
+        return torch.where(denom > 1.0e-8, corr, torch.zeros_like(corr))
+
+    @staticmethod
+    def _event_precision_recall(pred, gt):
+        pred = pred.reshape(-1)
+        gt = gt.reshape(-1)
+        tp = torch.sum((pred & gt).float())
+        pred_n = torch.sum(pred.float())
+        gt_n = torch.sum(gt.float())
+        precision = tp / torch.clamp(pred_n, min=1.0)
+        recall = tp / torch.clamp(gt_n, min=1.0)
+        f1 = 2.0 * precision * recall / torch.clamp(
+            precision + recall, min=1.0e-8
+        )
+        return precision, recall, f1
+
     def _cache_admittance_diagnostics(self):
         cfg = self.cfg.learned_admittance
         alpha = self.admittance.alpha
+        effective_alpha = self.admittance.effective_alpha
         compression_m = self.admittance.delta_l
         est_force = self.admittance.estimated_force
         est_loading = self.admittance.estimated_loading_rate
@@ -171,12 +198,30 @@ class MCLearnedAdmittance100Hz(MC):
         gate_active_threshold = float(
             getattr(cfg, "diagnostic_gate_active_threshold", 0.5)
         )
+        force_event_threshold = float(
+            getattr(cfg, "diagnostic_force_event_threshold_n", 60.0)
+        )
+        loading_event_threshold = float(
+            getattr(cfg, "diagnostic_loading_event_threshold_nps", 5000.0)
+        )
         target_force_clip_n = (
             float(cfg.contact_target_clip) * float(cfg.contact_force_scale_n)
         )
         target_loading_clip_nps = (
             float(cfg.contact_target_clip)
             * float(cfg.contact_loading_rate_scale_nps)
+        )
+
+        pred_force_event = est_force >= force_event_threshold
+        gt_force_event = gt_force >= force_event_threshold
+        force_precision, force_recall, force_f1 = self._event_precision_recall(
+            pred_force_event, gt_force_event
+        )
+
+        pred_loading_event = est_loading >= loading_event_threshold
+        gt_loading_event = gt_loading >= loading_event_threshold
+        loading_precision, loading_recall, loading_f1 = self._event_precision_recall(
+            pred_loading_event, gt_loading_event
         )
 
         self._last_admittance_diagnostics = {
@@ -186,6 +231,9 @@ class MCLearnedAdmittance100Hz(MC):
             "Admittance/alpha_active_ratio": torch.mean(
                 (alpha > alpha_active_threshold).float()
             ),
+            "Admittance/effective_alpha_mean": torch.mean(effective_alpha),
+            "Admittance/effective_alpha_p95": self._p95(effective_alpha),
+            "Admittance/effective_alpha_max": torch.max(effective_alpha),
             "Admittance/compression_mean_mm": torch.mean(compression_m) * 1000.0,
             "Admittance/compression_p95_mm": self._p95(compression_m) * 1000.0,
             "Admittance/compression_max_mm": torch.max(compression_m) * 1000.0,
@@ -206,6 +254,12 @@ class MCLearnedAdmittance100Hz(MC):
             "Estimator/axial_force_gt_mean_n": torch.mean(gt_force),
             "Estimator/axial_force_gt_max_n": torch.max(gt_force),
             "Estimator/axial_force_mae_n": torch.mean(torch.abs(est_force - gt_force)),
+            "Estimator/axial_force_corr": self._pearson_corr(est_force, gt_force),
+            "Estimator/force_event_pred_ratio": torch.mean(pred_force_event.float()),
+            "Estimator/force_event_gt_ratio": torch.mean(gt_force_event.float()),
+            "Estimator/force_event_precision": force_precision,
+            "Estimator/force_event_recall": force_recall,
+            "Estimator/force_event_f1": force_f1,
             "Estimator/loading_pred_mean_nps": torch.mean(est_loading),
             "Estimator/loading_pred_max_nps": torch.max(est_loading),
             "Estimator/loading_gt_mean_nps": torch.mean(gt_loading),
@@ -213,6 +267,14 @@ class MCLearnedAdmittance100Hz(MC):
             "Estimator/loading_mae_nps": torch.mean(
                 torch.abs(est_loading - gt_loading)
             ),
+            "Estimator/loading_corr": self._pearson_corr(est_loading, gt_loading),
+            "Estimator/loading_event_pred_ratio": torch.mean(
+                pred_loading_event.float()
+            ),
+            "Estimator/loading_event_gt_ratio": torch.mean(gt_loading_event.float()),
+            "Estimator/loading_event_precision": loading_precision,
+            "Estimator/loading_event_recall": loading_recall,
+            "Estimator/loading_event_f1": loading_f1,
             "Estimator/force_target_clip_ratio": torch.mean(
                 (gt_force >= target_force_clip_n).float()
             ),
