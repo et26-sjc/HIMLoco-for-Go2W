@@ -100,11 +100,9 @@ class MCLearnedAdmittance100Hz(MC):
         )
 
         shape = (self.num_envs, 4)
-        # Quiet metrics use full 3-D force magnitude.
         self.gt_step_peak_force = torch.zeros(shape, device=self.device)
         self.gt_step_peak_loading_rate = torch.zeros(shape, device=self.device)
         self.gt_prev_force_norm = torch.zeros(shape, device=self.device)
-        # Estimator targets use compressive axial force along hip -> wheel.
         self.gt_step_peak_axial_force = torch.zeros(shape, device=self.device)
         self.gt_step_peak_axial_loading_rate = torch.zeros(shape, device=self.device)
         self.gt_prev_axial_force = torch.zeros(shape, device=self.device)
@@ -120,6 +118,8 @@ class MCLearnedAdmittance100Hz(MC):
         self.transition_contact_estimator_target = torch.zeros_like(
             self.contact_estimator_target
         )
+
+        self._last_admittance_diagnostics = {}
 
     def _base_vel_z(self):
         return quat_rotate_inverse(
@@ -137,6 +137,103 @@ class MCLearnedAdmittance100Hz(MC):
 
     def get_contact_estimator_target(self):
         return self.transition_contact_estimator_target
+
+    def get_admittance_diagnostics(self):
+        return {
+            key: value.detach() for key, value in self._last_admittance_diagnostics.items()
+        }
+
+    @staticmethod
+    def _p95(x):
+        flat = x.reshape(-1)
+        if flat.numel() == 0:
+            return torch.zeros((), device=x.device, dtype=x.dtype)
+        return torch.quantile(flat, 0.95)
+
+    def _cache_admittance_diagnostics(self):
+        cfg = self.cfg.learned_admittance
+        alpha = self.admittance.alpha
+        compression_m = self.admittance.delta_l
+        est_force = self.admittance.estimated_force
+        est_loading = self.admittance.estimated_loading_rate
+        gt_force = self.gt_step_peak_axial_force
+        gt_loading = self.gt_step_peak_axial_loading_rate
+        gate = self.admittance.loading_gate
+        transient = self.admittance.transient_force
+        drive = self.admittance.drive_force
+        stiffness = self.admittance.stiffness
+        support_bias = self.admittance.force_bias
+        joint_offsets = torch.abs(self.admittance.last_joint_offsets)
+
+        alpha_active_threshold = float(
+            getattr(cfg, "diagnostic_alpha_active_threshold", 0.05)
+        )
+        gate_active_threshold = float(
+            getattr(cfg, "diagnostic_gate_active_threshold", 0.5)
+        )
+        target_force_clip_n = (
+            float(cfg.contact_target_clip) * float(cfg.contact_force_scale_n)
+        )
+        target_loading_clip_nps = (
+            float(cfg.contact_target_clip)
+            * float(cfg.contact_loading_rate_scale_nps)
+        )
+
+        self._last_admittance_diagnostics = {
+            "Admittance/alpha_mean": torch.mean(alpha),
+            "Admittance/alpha_p95": self._p95(alpha),
+            "Admittance/alpha_max": torch.max(alpha),
+            "Admittance/alpha_active_ratio": torch.mean(
+                (alpha > alpha_active_threshold).float()
+            ),
+            "Admittance/compression_mean_mm": torch.mean(compression_m) * 1000.0,
+            "Admittance/compression_p95_mm": self._p95(compression_m) * 1000.0,
+            "Admittance/compression_max_mm": torch.max(compression_m) * 1000.0,
+            "Admittance/joint_offset_abs_mean_rad": torch.mean(joint_offsets),
+            "Admittance/joint_offset_abs_max_rad": torch.max(joint_offsets),
+            "Admittance/gate_mean": torch.mean(gate),
+            "Admittance/gate_active_ratio": torch.mean(
+                (gate > gate_active_threshold).float()
+            ),
+            "Admittance/transient_force_mean_n": torch.mean(transient),
+            "Admittance/transient_force_max_n": torch.max(transient),
+            "Admittance/drive_force_mean_n": torch.mean(drive),
+            "Admittance/drive_force_max_n": torch.max(drive),
+            "Admittance/stiffness_mean_npm": torch.mean(stiffness),
+            "Admittance/support_bias_mean_n": torch.mean(support_bias),
+            "Estimator/axial_force_pred_mean_n": torch.mean(est_force),
+            "Estimator/axial_force_pred_max_n": torch.max(est_force),
+            "Estimator/axial_force_gt_mean_n": torch.mean(gt_force),
+            "Estimator/axial_force_gt_max_n": torch.max(gt_force),
+            "Estimator/axial_force_mae_n": torch.mean(torch.abs(est_force - gt_force)),
+            "Estimator/loading_pred_mean_nps": torch.mean(est_loading),
+            "Estimator/loading_pred_max_nps": torch.max(est_loading),
+            "Estimator/loading_gt_mean_nps": torch.mean(gt_loading),
+            "Estimator/loading_gt_max_nps": torch.max(gt_loading),
+            "Estimator/loading_mae_nps": torch.mean(
+                torch.abs(est_loading - gt_loading)
+            ),
+            "Estimator/force_target_clip_ratio": torch.mean(
+                (gt_force >= target_force_clip_n).float()
+            ),
+            "Estimator/loading_target_clip_ratio": torch.mean(
+                (gt_loading >= target_loading_clip_nps).float()
+            ),
+            "Impact/gt_3d_force_peak_mean_n": torch.mean(self.gt_step_peak_force),
+            "Impact/gt_3d_force_peak_max_n": torch.max(self.gt_step_peak_force),
+            "Impact/gt_3d_loading_peak_mean_nps": torch.mean(
+                self.gt_step_peak_loading_rate
+            ),
+            "Impact/gt_3d_loading_peak_max_nps": torch.max(
+                self.gt_step_peak_loading_rate
+            ),
+            "Impact/gt_base_acc_peak_mean_mps2": torch.mean(
+                self.gt_step_peak_base_acc
+            ),
+            "Impact/gt_base_acc_peak_max_mps2": torch.max(
+                self.gt_step_peak_base_acc
+            ),
+        }
 
     def _begin_gt_impact_step(self):
         self.gt_step_peak_force.zero_()
@@ -156,7 +253,6 @@ class MCLearnedAdmittance100Hz(MC):
         leg_axis = leg_vec / torch.clamp(
             torch.norm(leg_vec, dim=-1, keepdim=True), min=1.0e-6
         )
-        # leg_axis points hip -> wheel; compressive GRF points wheel -> hip.
         axial_force = torch.clamp(
             torch.sum(force_vec * (-leg_axis), dim=-1), min=0.0
         )
@@ -329,6 +425,7 @@ class MCLearnedAdmittance100Hz(MC):
 
         self._finish_gt_impact_step()
         self.transition_contact_estimator_target.copy_(self.contact_estimator_target)
+        self._cache_admittance_diagnostics()
         termination_ids, termination_privileged_obs = self.post_physics_step()
 
         clip_obs = self.cfg.normalization.clip_observations
