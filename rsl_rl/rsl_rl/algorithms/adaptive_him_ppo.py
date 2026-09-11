@@ -34,6 +34,7 @@ class AdaptiveHIMPPO:
         base_actor_lr_scale=0.0,
         action_std_lr_scale=0.0,
         update_him_estimator=False,
+        freeze_contact_estimator_after_warmup=False,
         device="cpu",
     ):
         self.device = device
@@ -41,6 +42,9 @@ class AdaptiveHIMPPO:
         self.base_actor_lr_scale = float(base_actor_lr_scale)
         self.action_std_lr_scale = float(action_std_lr_scale)
         self.update_him_estimator = bool(update_him_estimator)
+        self.freeze_contact_estimator_after_warmup = bool(
+            freeze_contact_estimator_after_warmup
+        )
 
         base_actor_params = list(self.actor_critic.actor.parameters())
         adaptive_params = (
@@ -190,7 +194,7 @@ class AdaptiveHIMPPO:
             "him_estimation": 0.0,
             "him_swap": 0.0,
             "contact_force": 0.0,
-            "contact_loading": 0.0,
+            "contact_impact": 0.0,
         }
 
         generator = self.storage.mini_batch_generator(
@@ -234,13 +238,16 @@ class AdaptiveHIMPPO:
             else:
                 him_estimation, him_swap = 0.0, 0.0
 
-            contact_force, contact_loading = (
-                self.actor_critic.contact_estimator.update(
-                    obs_batch,
-                    controller_state_batch,
-                    contact_target_batch,
+            if self.freeze_contact_estimator_after_warmup:
+                contact_force, contact_impact = 0.0, 0.0
+            else:
+                contact_force, contact_impact = (
+                    self.actor_critic.contact_estimator.update(
+                        obs_batch,
+                        controller_state_batch,
+                        contact_target_batch,
+                    )
                 )
-            )
 
             ratio = torch.exp(
                 actions_log_prob_batch
@@ -286,7 +293,7 @@ class AdaptiveHIMPPO:
             totals["him_estimation"] += him_estimation
             totals["him_swap"] += him_swap
             totals["contact_force"] += contact_force
-            totals["contact_loading"] += contact_loading
+            totals["contact_impact"] += contact_impact
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         for key in totals:

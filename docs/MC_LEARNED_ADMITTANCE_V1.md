@@ -1,10 +1,10 @@
 # MC Learned Admittance v1
 
-Branch: `mc-learned-admittance-v1`
+Branch: `mc-impact-classifier-admittance-v1`
 
 This branch extends the trained `mc_100hz` HIMLoco baseline with a learned,
-sensorless per-leg admittance controller. The baseline branch is intentionally
-left unchanged.
+sensorless per-leg admittance controller triggered by impact classification.
+The baseline branch is intentionally left unchanged.
 
 ## 1. Hard information-flow boundary
 
@@ -14,8 +14,9 @@ The deployed policy/controller may use only:
 
 - original 6-frame HIM proprioceptive history: 342D (`57 x 6`);
 - original HIM estimate: base velocity 3D + latent 16D;
-- learned contact estimate 8D: axial compressive force (4) + positive axial
-  loading rate (4), both normalized;
+- learned contact estimate 8D: normalized axial compressive force (4) + raw
+  impact logits (4); control probability is
+  `sigmoid(logit - correction_scale * log(pos_weight))`;
 - complete normalized admittance state 16D:
   - compression/max compression (4),
   - compression velocity/max compression velocity (4),
@@ -63,7 +64,7 @@ history 342
   +--> original HIM estimator --> v_hat(3), z(16)
   |
   +--> ContactEstimator(history, controller_state16)
-                         --> F_axial_hat(4), dF_axial_hat(4)
+                         --> F_axial_hat(4), impact_logits(4)
 
 current proprio57 + v_hat + z + contact_hat + controller_state16
   |
@@ -79,13 +80,13 @@ The ContactEstimator receives no force sensor signal at inference time.
 At every 200 Hz physics substep training computes both:
 
 1. full 3-D wheel force magnitude/loading rate for quiet rewards and metrics;
-2. compressive force projected onto the current hip-to-wheel leg axis and its
-   positive loading rate for ContactEstimator supervision.
+2. compressive force projected onto the current hip-to-wheel leg axis and a
+   binary impact label obtained by thresholding its positive loading rate.
 
-The estimator target for each 100 Hz transition is the peak axial force and peak
-positive axial loading rate over the two physics substeps, normalized and
-clipped. This makes it a short-horizon impact predictor rather than a direct
-instantaneous force-sensor substitute.
+The estimator target for each 100 Hz transition is normalized peak axial force
+plus `impact = peak_axial_loading_rate > 5000 N/s` over its two physics
+substeps. Training pairs this label with the post-step proprioceptive history,
+so this is current-event recognition rather than a future-impact regression.
 
 ## 5. Admittance law
 
@@ -93,7 +94,7 @@ For each leg:
 
 ```text
 M*x_ddot + D(alpha)*x_dot + K(alpha)*x
-    = alpha * gate(dF_hat) * F_transient_hat
+    = alpha * (1 + impact_gain*p_impact) * F_transient_hat
 
 K(alpha) = K_max - alpha*(K_max-K_min)
 D(alpha) = 2*zeta*sqrt(M*K(alpha))
@@ -119,7 +120,7 @@ Default: 500 policy transitions.
 - deterministic original baseline motion only;
 - force all four compliance actions to exactly zero;
 - no PPO update, no critic update, no HIM update;
-- train only ContactEstimator from simulator-only axial force/loading labels.
+- train only ContactEstimator from simulator-only axial-force/impact labels.
 
 With 4096 environments, 500 transitions provide roughly 2 million labeled
 samples while the physical behavior remains the original baseline.
@@ -167,14 +168,15 @@ Important groups include:
 ```text
 Admittance/alpha_mean, alpha_p95, alpha_max, alpha_active_ratio
 Admittance/compression_mean_mm, compression_p95_mm, compression_max_mm
-Admittance/gate_mean, gate_active_ratio
+Admittance/impact_probability_mean, impact_probability_p95, impact_active_ratio
+Admittance/compression_when_impact_mm, compression_when_noimpact_mm
 Admittance/transient_force_mean_n, drive_force_mean_n
 Admittance/stiffness_mean_npm, support_bias_mean_n
 Admittance/joint_offset_abs_mean_rad / max_rad
 
 Estimator/axial_force_pred_mean_n / gt_mean_n / mae_n
-Estimator/loading_pred_mean_nps / gt_mean_nps / mae_nps
-Estimator/force_target_clip_ratio / loading_target_clip_ratio
+Estimator/impact_precision / impact_recall / impact_f1
+Estimator/force_target_clip_ratio
 
 Impact/gt_3d_force_peak_mean_n / max_n
 Impact/gt_3d_loading_peak_mean_nps / max_nps
@@ -242,9 +244,10 @@ Before a long run verify:
 4. baseline actor/HIM/critic and first 16 std values migrate successfully;
 5. W&B reports `Policy/compliance_noise_std` close to 0.15 in a fresh run;
 6. warm-up executes baseline motion with alpha forced to zero;
-7. contact force/loading losses decrease during warm-up;
+7. contact force/impact-classification losses decrease during warm-up;
 8. Stage-1 baseline motion output remains identical to the loaded checkpoint;
-9. `alpha_p95`, `compression_p95_mm`, gate and transient force are nonzero around impacts;
+9. `alpha_p95`, `compression_p95_mm`, impact probability and transient force are
+   nonzero around impacts;
 10. velocity/yaw tracking remains near baseline while force/loading/base-acc fall.
 
 ## 9. Evaluation and deployment status
@@ -268,10 +271,10 @@ state, execute the same second-order dynamics/Jacobian mapping, and consume the
 JIT ContactEstimator output. MuJoCo/real contact force must never be used as a
 controller input.
 
-## 10. Research note on prediction horizon
+## 10. Research note on classifier timing
 
-The estimator predicts impact over the upcoming 10 ms policy transition. The
-target is therefore partly action-dependent. Stage 1 intentionally fixes the
-baseline motion mapping, making this dependence relatively clean. If Stage 2
-allows locomotion co-adaptation, nominal upcoming motion action should be tested
-as an additional deployable estimator context input.
+The binary target describes the 10 ms transition that just produced the current
+post-step proprioceptive history. It is not shifted forward as a future-impact
+target. At deployment the classified event can therefore affect the following
+control interval; this causal delay must be considered when interpreting very
+short impacts.

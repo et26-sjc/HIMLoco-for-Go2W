@@ -177,10 +177,11 @@ class PolicyExporterHIM(torch.nn.Module):
 class PolicyExporterAdaptiveHIM(torch.nn.Module):
     """Export deployable policy inference without any privileged force input.
 
-    Forward inputs are the original flattened 342-D HIM history and the 12-D
+    Forward inputs are the original flattened 342-D HIM history and the 16-D
     internal admittance state. It returns a tuple ``(policy_action20,
-    contact_estimate8)``. The low-level deployment code must feed the latter into
-    the same sensorless admittance dynamics used during training.
+    contact_estimate8)``, where the contact estimate is normalized force (4)
+    followed by impact logits (4). The low-level deployment code must feed it
+    into the same sensorless admittance dynamics used during training.
     """
 
     def __init__(self, actor_critic):
@@ -208,7 +209,9 @@ class PolicyExporterAdaptiveHIM(torch.nn.Module):
         contact_raw = self.contact_estimator(
             torch.cat((obs_b, ctrl_b), dim=-1)
         ).squeeze(0)
-        contact = F.softplus(contact_raw)
+        contact = torch.cat(
+            (F.softplus(contact_raw[:4]), contact_raw[4:]), dim=0
+        )
 
         obs_curr = obs_history[: self.num_one_step_obs]
         baseline_input = torch.cat((obs_curr, vel, z), dim=0)

@@ -20,8 +20,15 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
     class learned_admittance:
         enabled = True
         contact_force_scale_n = 100.0
-        contact_loading_rate_scale_nps = 10000.0
         contact_target_clip = 5.0
+        contact_impact_threshold_nps = 5000.0
+        impact_gain = 2.0
+        # Inference-only calibration for logits learned with weighted BCE. This
+        # must match policy.contact_estimator_impact_pos_weight.
+        impact_probability_pos_weight_correction = 3.0
+        # Ablation knob: p_control = sigmoid(logit - scale * log(pos_weight)).
+        # It changes only the classifier-to-control mapping, not estimator loss.
+        impact_logit_correction_scale = 0.10
 
         virtual_mass_kg = 1.9
         damping_ratio = 1.0
@@ -37,8 +44,6 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
 
         force_bias_time_constant_s = 0.10
         force_deadband_n = 10.0
-        loading_rate_gate_nps = 5000.0
-        loading_rate_gate_softness_nps = 2500.0
         max_force_input_n = 250.0
 
         max_compression_m = 0.020
@@ -52,9 +57,8 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
         # Diagnostic thresholds only. These values are never fed back into the
         # actor/critic/reward path; they only define W&B summary counters.
         diagnostic_alpha_active_threshold = 0.05
-        diagnostic_gate_active_threshold = 0.50
+        diagnostic_impact_probability_threshold = 0.50
         diagnostic_force_event_threshold_n = 60.0
-        diagnostic_loading_event_threshold_nps = 5000.0
 
     class quiet_training:
         force_threshold_n = 60.0
@@ -75,9 +79,19 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
 class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
     class policy(MC100HzCfgPPO.policy):
         contact_estimator_hidden_dims = [128, 64]
+        # Fixed default. LR stability ablations override only this config value;
+        # the ContactEstimator architecture and update path remain unchanged.
         contact_estimator_lr = 1.0e-3
+        # Stage-specific LR defaults reproduce the legacy single-LR behavior.
+        # They only change the existing ContactEstimator Adam learning rate.
+        contact_estimator_warmup_lr = 1.0e-3
+        contact_estimator_online_lr = 1.0e-3
         contact_estimator_loss_force = 1.0
-        contact_estimator_loss_loading = 0.5
+        contact_estimator_loss_impact = 1.0
+        contact_estimator_impact_pos_weight = 3.0
+        # Replay samples per online sample; zero preserves legacy behavior.
+        contact_estimator_replay_ratio = 0.0
+        contact_estimator_replay_buffer_size = 8192
         motion_adapter_scale = 0.0
         # 0.05 was too conservative: after clipping negative samples to zero the
         # admittance almost never experienced a physically meaningful response.
@@ -90,13 +104,16 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         base_actor_lr_scale = 0.0
         action_std_lr_scale = 0.0
         update_him_estimator = False
+        # Stage 0 always trains ContactEstimator. When enabled, this switch only
+        # suppresses its supervised optimizer updates during Stage 1.
+        freeze_contact_estimator_after_warmup = False
 
     class runner(MC100HzCfgPPO.runner):
         policy_class_name = "AdaptiveHIMActorCritic"
         algorithm_class_name = "AdaptiveHIMPPO"
         runner_class_name = "AdaptiveHIMOnPolicyRunner"
-        experiment_name = "MC_LearnedAdmittance_100Hz"
-        run_name = "sensorless_admittance_v1"
+        experiment_name = "MC_ImpactClassifier_Admittance_100Hz"
+        run_name = "impact_classifier_admittance_v1"
 
         init_experiment_name = "MC_100Hz"
         init_load_run = -1
@@ -104,6 +121,11 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
 
         contact_pretrain_steps = 500
         contact_pretrain_log_interval = 50
+        contact_validation_steps = 200
+        contact_validation_interval = 20
+        contact_validation_batch_size = 8192
+        contact_validation_path = ""
+        contact_replay_path = ""
 
         wandb_group = "mc-learned-admittance"
         wandb_tags = [
@@ -111,7 +133,7 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
             "HIMLoco",
             "wheel-legged",
             "100Hz",
-            "sensorless-contact-estimator",
+            "sensorless-impact-classifier",
             "learned-admittance",
             "policy20-physical16",
             "stage0-contact-warmup",
@@ -119,5 +141,6 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
             "stage1-compliance-only",
             "compliance-std-0.15",
             "effective-alpha-gain-6",
+            "impact-trigger",
             "raw-admittance-diagnostics",
         ]

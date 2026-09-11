@@ -8,9 +8,9 @@ The environment separates three information domains explicitly:
 * training-only ground-truth impact signals from Isaac Gym contact tensors.
 
 The deployed admittance never reads ground-truth contact force. During training,
-3-D wheel contact force is used in two different ways: force norm/loading-rate
-norm supervise quiet rewards, while the force projected onto each hip-to-wheel
-axis supervises the contact estimator that drives the physical admittance.
+3-D wheel contact force supervises quiet rewards. Force projected onto each
+hip-to-wheel axis supervises force regression, and its thresholded positive
+loading rate supplies the binary impact label.
 """
 
 from isaacgym import gymtorch
@@ -118,6 +118,17 @@ class MCLearnedAdmittance100Hz(MC):
         self.transition_contact_estimator_target = torch.zeros_like(
             self.contact_estimator_target
         )
+        # Diagnostics/validation only: GT loading rate associated with
+        # transition_contact_estimator_target. It is never exposed to policy,
+        # estimator, reward, or admittance control inputs.
+        self.transition_gt_axial_loading_rate = torch.zeros(
+            shape, device=self.device
+        )
+        # Diagnostics only: y_(t-1), whose post-step proprioception produced the
+        # classifier state used to control the transition currently in progress.
+        self.control_aligned_gt_impact = torch.zeros(
+            shape, dtype=torch.bool, device=self.device
+        )
 
         self._last_admittance_diagnostics = {}
 
@@ -137,6 +148,10 @@ class MCLearnedAdmittance100Hz(MC):
 
     def get_contact_estimator_target(self):
         return self.transition_contact_estimator_target
+
+    def get_contact_validation_loading_rate(self):
+        """Return diagnostic GT loading rate aligned with the current target."""
+        return self.transition_gt_axial_loading_rate
 
     def get_admittance_diagnostics(self):
         return {
@@ -176,16 +191,199 @@ class MCLearnedAdmittance100Hz(MC):
         )
         return precision, recall, f1
 
+    @staticmethod
+    def _masked_mean(values, mask):
+        weights = mask.to(dtype=values.dtype)
+        return torch.sum(values * weights) / torch.clamp(
+            torch.sum(weights), min=1.0
+        )
+
+    @staticmethod
+    def _masked_quantile(values, mask, quantile):
+        selected = values.reshape(-1)[mask.reshape(-1)]
+        if selected.numel() == 0:
+            return torch.zeros((), device=values.device, dtype=values.dtype)
+        return torch.quantile(selected, float(quantile))
+
+    @classmethod
+    def _binary_probability_diagnostics(cls, probability, gt, threshold=0.5):
+        predicted = probability >= float(threshold)
+        precision, recall, f1 = cls._event_precision_recall(predicted, gt)
+        return {
+            "pred_ratio": torch.mean(predicted.float()),
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        }
+
+    def cache_contact_estimator_diagnostics(self, current_contact_estimate):
+        """Evaluate the classifier against the event represented by current obs."""
+        if current_contact_estimate.shape[-1] != self.contact_estimate_dim:
+            raise RuntimeError(
+                f"Expected {self.contact_estimate_dim}D contact estimate, got "
+                f"{current_contact_estimate.shape[-1]}D"
+            )
+
+        cfg = self.cfg.learned_admittance
+        estimated_force = (
+            torch.clamp(current_contact_estimate[:, :4], min=0.0)
+            * float(cfg.contact_force_scale_n)
+        )
+        raw_impact_logits = current_contact_estimate[:, 4:]
+        raw_impact_probability = torch.sigmoid(raw_impact_logits)
+        impact_probability = self.admittance.impact_probability_from_logits(
+            raw_impact_logits
+        )
+        gt_force = self.gt_step_peak_axial_force
+        gt_impact = self.contact_estimator_target[:, 4:] >= 0.5
+
+        impact_threshold = float(
+            getattr(cfg, "diagnostic_impact_probability_threshold", 0.5)
+        )
+        raw_metrics = self._binary_probability_diagnostics(
+            raw_impact_probability, gt_impact, impact_threshold
+        )
+        fullcorr_metrics = self._binary_probability_diagnostics(
+            impact_probability, gt_impact, impact_threshold
+        )
+        predicted_impact = impact_probability >= impact_threshold
+
+        force_event_threshold = float(
+            getattr(cfg, "diagnostic_force_event_threshold_n", 60.0)
+        )
+        predicted_force_event = estimated_force >= force_event_threshold
+        gt_force_event = gt_force >= force_event_threshold
+        force_precision, force_recall, force_f1 = self._event_precision_recall(
+            predicted_force_event, gt_force_event
+        )
+        target_force_clip_n = (
+            float(cfg.contact_target_clip) * float(cfg.contact_force_scale_n)
+        )
+
+        self._last_admittance_diagnostics.update(
+            {
+                "Estimator/axial_force_pred_mean_n": torch.mean(estimated_force),
+                "Estimator/axial_force_pred_max_n": torch.max(estimated_force),
+                "Estimator/axial_force_gt_mean_n": torch.mean(gt_force),
+                "Estimator/axial_force_gt_max_n": torch.max(gt_force),
+                "Estimator/axial_force_mae_n": torch.mean(
+                    torch.abs(estimated_force - gt_force)
+                ),
+                "Estimator/axial_force_corr": self._pearson_corr(
+                    estimated_force, gt_force
+                ),
+                "Estimator/force_event_pred_ratio": torch.mean(
+                    predicted_force_event.float()
+                ),
+                "Estimator/force_event_gt_ratio": torch.mean(
+                    gt_force_event.float()
+                ),
+                "Estimator/force_event_precision": force_precision,
+                "Estimator/force_event_recall": force_recall,
+                "Estimator/force_event_f1": force_f1,
+                "Estimator/impact_precision": fullcorr_metrics["precision"],
+                "Estimator/impact_recall": fullcorr_metrics["recall"],
+                "Estimator/impact_f1": fullcorr_metrics["f1"],
+                "Estimator/impact_gt_ratio": torch.mean(gt_impact.float()),
+                "Estimator/impact_pred_ratio": torch.mean(
+                    predicted_impact.float()
+                ),
+                "Estimator/raw_logit_positive_mean": self._masked_mean(
+                    raw_impact_logits, gt_impact
+                ),
+                "Estimator/raw_logit_negative_mean": self._masked_mean(
+                    raw_impact_logits, ~gt_impact
+                ),
+                "Estimator/raw_logit_positive_p50": self._masked_quantile(
+                    raw_impact_logits, gt_impact, 0.50
+                ),
+                "Estimator/raw_logit_negative_p50": self._masked_quantile(
+                    raw_impact_logits, ~gt_impact, 0.50
+                ),
+                "Estimator/raw_logit_positive_p95": self._masked_quantile(
+                    raw_impact_logits, gt_impact, 0.95
+                ),
+                "Estimator/raw_logit_negative_p95": self._masked_quantile(
+                    raw_impact_logits, ~gt_impact, 0.95
+                ),
+                "Estimator/raw_logit_separation": self._masked_mean(
+                    raw_impact_logits, gt_impact
+                ) - self._masked_mean(raw_impact_logits, ~gt_impact),
+                "Estimator/raw_probability_positive_mean": self._masked_mean(
+                    raw_impact_probability, gt_impact
+                ),
+                "Estimator/raw_probability_negative_mean": self._masked_mean(
+                    raw_impact_probability, ~gt_impact
+                ),
+                "Estimator/raw_probability_mean": torch.mean(
+                    raw_impact_probability
+                ),
+                "Estimator/raw_probability_separation": self._masked_mean(
+                    raw_impact_probability, gt_impact
+                ) - self._masked_mean(raw_impact_probability, ~gt_impact),
+                "Estimator/raw_impact_pred_ratio": raw_metrics["pred_ratio"],
+                "Estimator/raw_impact_precision": raw_metrics["precision"],
+                "Estimator/raw_impact_recall": raw_metrics["recall"],
+                "Estimator/raw_impact_f1": raw_metrics["f1"],
+                "Estimator/fullcorr_probability_positive_mean": self._masked_mean(
+                    impact_probability, gt_impact
+                ),
+                "Estimator/fullcorr_probability_negative_mean": self._masked_mean(
+                    impact_probability, ~gt_impact
+                ),
+                "Estimator/fullcorr_pred_ratio": fullcorr_metrics["pred_ratio"],
+                "Estimator/fullcorr_precision": fullcorr_metrics["precision"],
+                "Estimator/fullcorr_recall": fullcorr_metrics["recall"],
+                "Estimator/fullcorr_f1": fullcorr_metrics["f1"],
+                "Estimator/force_target_clip_ratio": torch.mean(
+                    (gt_force >= target_force_clip_n).float()
+                ),
+            }
+        )
+
+        # Offline calibration sweep over fractions of log(pos_weight). None of
+        # these diagnostic probabilities enters the active controller.
+        for label, fraction in (
+            ("0p00", 0.00),
+            ("0p25", 0.25),
+            ("0p50", 0.50),
+            ("0p75", 0.75),
+            ("1p00", 1.00),
+        ):
+            probability = torch.sigmoid(
+                raw_impact_logits
+                - fraction * self.admittance.impact_pos_weight_log_correction
+            )
+            metrics = self._binary_probability_diagnostics(
+                probability, gt_impact, impact_threshold
+            )
+            for metric_name, value in metrics.items():
+                self._last_admittance_diagnostics[
+                    f"Calibration/corr_{label}_{metric_name}"
+                ] = value
+
+        # Optional raw-probability threshold sweep, also diagnostics only.
+        for label, threshold in (
+            ("0p30", 0.30),
+            ("0p40", 0.40),
+            ("0p50", 0.50),
+            ("0p60", 0.60),
+            ("0p70", 0.70),
+        ):
+            metrics = self._binary_probability_diagnostics(
+                raw_impact_probability, gt_impact, threshold
+            )
+            for metric_name, value in metrics.items():
+                self._last_admittance_diagnostics[
+                    f"Threshold/raw_{label}_{metric_name}"
+                ] = value
+
     def _cache_admittance_diagnostics(self):
         cfg = self.cfg.learned_admittance
         alpha = self.admittance.alpha
         effective_alpha = self.admittance.effective_alpha
         compression_m = self.admittance.delta_l
-        est_force = self.admittance.estimated_force
-        est_loading = self.admittance.estimated_loading_rate
-        gt_force = self.gt_step_peak_axial_force
-        gt_loading = self.gt_step_peak_axial_loading_rate
-        gate = self.admittance.loading_gate
+        impact_probability = self.admittance.impact_probability
         transient = self.admittance.transient_force
         drive = self.admittance.drive_force
         stiffness = self.admittance.stiffness
@@ -195,34 +393,17 @@ class MCLearnedAdmittance100Hz(MC):
         alpha_active_threshold = float(
             getattr(cfg, "diagnostic_alpha_active_threshold", 0.05)
         )
-        gate_active_threshold = float(
-            getattr(cfg, "diagnostic_gate_active_threshold", 0.5)
+        impact_probability_threshold = float(
+            getattr(cfg, "diagnostic_impact_probability_threshold", 0.5)
         )
-        force_event_threshold = float(
-            getattr(cfg, "diagnostic_force_event_threshold_n", 60.0)
-        )
-        loading_event_threshold = float(
-            getattr(cfg, "diagnostic_loading_event_threshold_nps", 5000.0)
-        )
-        target_force_clip_n = (
-            float(cfg.contact_target_clip) * float(cfg.contact_force_scale_n)
-        )
-        target_loading_clip_nps = (
-            float(cfg.contact_target_clip)
-            * float(cfg.contact_loading_rate_scale_nps)
-        )
-
-        pred_force_event = est_force >= force_event_threshold
-        gt_force_event = gt_force >= force_event_threshold
-        force_precision, force_recall, force_f1 = self._event_precision_recall(
-            pred_force_event, gt_force_event
-        )
-
-        pred_loading_event = est_loading >= loading_event_threshold
-        gt_loading_event = gt_loading >= loading_event_threshold
-        loading_precision, loading_recall, loading_f1 = self._event_precision_recall(
-            pred_loading_event, gt_loading_event
-        )
+        predicted_impact = impact_probability >= impact_probability_threshold
+        # y_t describes the physical transition that just completed. These two
+        # legacy metrics are current-transition correlation diagnostics.
+        gt_impact = self.contact_estimator_target[:, 4:] >= 0.5
+        # y_(t-1) is causally aligned with the proprioceptive classifier state
+        # that controlled this transition; it is not a future-impact target.
+        control_aligned_gt_impact = self.control_aligned_gt_impact
+        loading_rate = self.gt_step_peak_axial_loading_rate
 
         self._last_admittance_diagnostics = {
             "Admittance/alpha_mean": torch.mean(alpha),
@@ -237,11 +418,33 @@ class MCLearnedAdmittance100Hz(MC):
             "Admittance/compression_mean_mm": torch.mean(compression_m) * 1000.0,
             "Admittance/compression_p95_mm": self._p95(compression_m) * 1000.0,
             "Admittance/compression_max_mm": torch.max(compression_m) * 1000.0,
+            "Admittance/compression_saturation_ratio": torch.mean(
+                (
+                    compression_m
+                    >= 0.95 * float(cfg.max_compression_m)
+                ).float()
+            ),
+            "Admittance/compression_over_10mm_ratio": torch.mean(
+                (compression_m >= 0.010).float()
+            ),
+            "Admittance/compression_when_impact_mm": self._masked_mean(
+                compression_m, gt_impact
+            ) * 1000.0,
+            "Admittance/compression_when_noimpact_mm": self._masked_mean(
+                compression_m, ~gt_impact
+            ) * 1000.0,
+            "Admittance/compression_after_impact_mm": self._masked_mean(
+                compression_m, control_aligned_gt_impact
+            ) * 1000.0,
+            "Admittance/compression_after_noimpact_mm": self._masked_mean(
+                compression_m, ~control_aligned_gt_impact
+            ) * 1000.0,
             "Admittance/joint_offset_abs_mean_rad": torch.mean(joint_offsets),
             "Admittance/joint_offset_abs_max_rad": torch.max(joint_offsets),
-            "Admittance/gate_mean": torch.mean(gate),
-            "Admittance/gate_active_ratio": torch.mean(
-                (gate > gate_active_threshold).float()
+            "Admittance/impact_probability_mean": torch.mean(impact_probability),
+            "Admittance/impact_probability_p95": self._p95(impact_probability),
+            "Admittance/impact_active_ratio": torch.mean(
+                predicted_impact.float()
             ),
             "Admittance/transient_force_mean_n": torch.mean(transient),
             "Admittance/transient_force_max_n": torch.max(transient),
@@ -249,38 +452,6 @@ class MCLearnedAdmittance100Hz(MC):
             "Admittance/drive_force_max_n": torch.max(drive),
             "Admittance/stiffness_mean_npm": torch.mean(stiffness),
             "Admittance/support_bias_mean_n": torch.mean(support_bias),
-            "Estimator/axial_force_pred_mean_n": torch.mean(est_force),
-            "Estimator/axial_force_pred_max_n": torch.max(est_force),
-            "Estimator/axial_force_gt_mean_n": torch.mean(gt_force),
-            "Estimator/axial_force_gt_max_n": torch.max(gt_force),
-            "Estimator/axial_force_mae_n": torch.mean(torch.abs(est_force - gt_force)),
-            "Estimator/axial_force_corr": self._pearson_corr(est_force, gt_force),
-            "Estimator/force_event_pred_ratio": torch.mean(pred_force_event.float()),
-            "Estimator/force_event_gt_ratio": torch.mean(gt_force_event.float()),
-            "Estimator/force_event_precision": force_precision,
-            "Estimator/force_event_recall": force_recall,
-            "Estimator/force_event_f1": force_f1,
-            "Estimator/loading_pred_mean_nps": torch.mean(est_loading),
-            "Estimator/loading_pred_max_nps": torch.max(est_loading),
-            "Estimator/loading_gt_mean_nps": torch.mean(gt_loading),
-            "Estimator/loading_gt_max_nps": torch.max(gt_loading),
-            "Estimator/loading_mae_nps": torch.mean(
-                torch.abs(est_loading - gt_loading)
-            ),
-            "Estimator/loading_corr": self._pearson_corr(est_loading, gt_loading),
-            "Estimator/loading_event_pred_ratio": torch.mean(
-                pred_loading_event.float()
-            ),
-            "Estimator/loading_event_gt_ratio": torch.mean(gt_loading_event.float()),
-            "Estimator/loading_event_precision": loading_precision,
-            "Estimator/loading_event_recall": loading_recall,
-            "Estimator/loading_event_f1": loading_f1,
-            "Estimator/force_target_clip_ratio": torch.mean(
-                (gt_force >= target_force_clip_n).float()
-            ),
-            "Estimator/loading_target_clip_ratio": torch.mean(
-                (gt_loading >= target_loading_clip_nps).float()
-            ),
             "Impact/gt_3d_force_peak_mean_n": torch.mean(self.gt_step_peak_force),
             "Impact/gt_3d_force_peak_max_n": torch.max(self.gt_step_peak_force),
             "Impact/gt_3d_loading_peak_mean_nps": torch.mean(
@@ -296,6 +467,37 @@ class MCLearnedAdmittance100Hz(MC):
                 self.gt_step_peak_base_acc
             ),
         }
+
+        # Diagnostic-only distribution of the unchanged 5000 N/s hard label.
+        # Ratios use every leg sample from the just-completed transition.
+        for name, lower, upper in (
+            ("0_3000", 0.0, 3000.0),
+            ("3000_4000", 3000.0, 4000.0),
+            ("4000_4500", 4000.0, 4500.0),
+            ("4500_4750", 4500.0, 4750.0),
+            ("4750_5000", 4750.0, 5000.0),
+            ("5000_5250", 5000.0, 5250.0),
+            ("5250_5500", 5250.0, 5500.0),
+            ("5500_6000", 5500.0, 6000.0),
+            ("6000_8000", 6000.0, 8000.0),
+        ):
+            in_bin = (loading_rate >= lower) & (loading_rate < upper)
+            self._last_admittance_diagnostics[
+                f"LabelDist/bin_{name}_ratio"
+            ] = torch.mean(in_bin.float())
+        self._last_admittance_diagnostics["LabelDist/bin_gt_8000_ratio"] = (
+            torch.mean((loading_rate >= 8000.0).float())
+        )
+        self._last_admittance_diagnostics[
+            "LabelDist/near_threshold_ratio"
+        ] = torch.mean(
+            ((loading_rate >= 4500.0) & (loading_rate <= 5500.0)).float()
+        )
+        self._last_admittance_diagnostics[
+            "LabelDist/very_near_threshold_ratio"
+        ] = torch.mean(
+            ((loading_rate >= 4750.0) & (loading_rate <= 5250.0)).float()
+        )
 
     def _begin_gt_impact_step(self):
         self.gt_step_peak_force.zero_()
@@ -362,12 +564,13 @@ class MCLearnedAdmittance100Hz(MC):
     def _finish_gt_impact_step(self):
         cfg = self.cfg.learned_admittance
         force = self.gt_step_peak_axial_force / float(cfg.contact_force_scale_n)
-        loading = self.gt_step_peak_axial_loading_rate / float(
-            cfg.contact_loading_rate_scale_nps
-        )
+        impact_label = (
+            self.gt_step_peak_axial_loading_rate
+            > float(cfg.contact_impact_threshold_nps)
+        ).float()
         clip = float(cfg.contact_target_clip)
         self.contact_estimator_target = torch.cat(
-            (torch.clamp(force, 0.0, clip), torch.clamp(loading, 0.0, clip)),
+            (torch.clamp(force, 0.0, clip), impact_label),
             dim=-1,
         )
 
@@ -433,6 +636,13 @@ class MCLearnedAdmittance100Hz(MC):
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
     def step(self, policy_actions, contact_estimate=None):
+        # Cache y_(t-1) before this step creates y_t. This buffer is used only
+        # to diagnose the compression caused by the classifier state controlling
+        # the upcoming physical transition.
+        self.control_aligned_gt_impact.copy_(
+            self.transition_contact_estimator_target[:, 4:] >= 0.5
+        )
+
         motion_actions, compliance_actions = self._split_policy_action(policy_actions)
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(motion_actions, -clip_actions, clip_actions).to(
@@ -487,6 +697,9 @@ class MCLearnedAdmittance100Hz(MC):
 
         self._finish_gt_impact_step()
         self.transition_contact_estimator_target.copy_(self.contact_estimator_target)
+        self.transition_gt_axial_loading_rate.copy_(
+            self.gt_step_peak_axial_loading_rate
+        )
         self._cache_admittance_diagnostics()
         termination_ids, termination_privileged_obs = self.post_physics_step()
 
@@ -523,6 +736,11 @@ class MCLearnedAdmittance100Hz(MC):
         self.gt_skip_rate_once[env_ids] = True
         self.gt_step_peak_base_acc[env_ids] = 0.0
         self.contact_estimator_target[env_ids] = 0.0
+        # The observation returned for a terminated environment is already the
+        # reset state, so it must not be paired with the terminal impact label.
+        self.transition_contact_estimator_target[env_ids] = 0.0
+        self.transition_gt_axial_loading_rate[env_ids] = 0.0
+        self.control_aligned_gt_impact[env_ids] = False
         self.gt_prev_base_vel_z[env_ids] = self._base_vel_z()[env_ids]
 
     def _reward_quiet_impact_force(self):

@@ -1,4 +1,4 @@
-"""HIM actor-critic extended with learned contact-aware admittance actions.
+"""HIM actor-critic extended with impact-aware admittance actions.
 
 The original HIM estimator and 16-D locomotion actor are preserved. New modules:
 1) a supervised ContactEstimator using deployable inputs only;
@@ -34,7 +34,10 @@ class AdaptiveHIMActorCritic(nn.Module):
         contact_estimator_hidden_dims=(128, 64),
         contact_estimator_lr=1.0e-3,
         contact_estimator_loss_force=1.0,
-        contact_estimator_loss_loading=0.5,
+        contact_estimator_loss_impact=1.0,
+        contact_estimator_impact_pos_weight=3.0,
+        contact_estimator_replay_ratio=0.0,
+        contact_estimator_replay_buffer_size=8192,
         motion_adapter_scale=0.05,
         compliance_init_std=0.15,
         **kwargs,
@@ -73,7 +76,10 @@ class AdaptiveHIMActorCritic(nn.Module):
             activation=activation,
             learning_rate=contact_estimator_lr,
             force_loss_weight=contact_estimator_loss_force,
-            loading_loss_weight=contact_estimator_loss_loading,
+            impact_loss_weight=contact_estimator_loss_impact,
+            impact_pos_weight=contact_estimator_impact_pos_weight,
+            replay_ratio=contact_estimator_replay_ratio,
+            replay_buffer_size=contact_estimator_replay_buffer_size,
         )
 
         # Baseline actor shape stays exactly checkpoint-compatible: 76 -> 16.

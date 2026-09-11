@@ -244,6 +244,7 @@ def _rms(values):
 def _add_distribution(summary, prefix, values):
     values = _finite(values)
     summary[prefix + "_sample_count"] = int(values.size)
+    summary[prefix + "_mean"] = float(np.mean(values)) if values.size else 0.0
     summary[prefix + "_p50"] = _percentile(values, 50)
     summary[prefix + "_p75"] = _percentile(values, 75)
     summary[prefix + "_p90"] = _percentile(values, 90)
@@ -308,7 +309,7 @@ def _save_results(summary, traces, event_samples, scenario, sample_rate_hz):
 
 
 def evaluate(args, options):
-    args.task = "quiet_mc"
+    args.task = "quiet_mc_100hz"
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     _configure_environment(env_cfg, args, options)
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
@@ -377,6 +378,8 @@ def evaluate(args, options):
     base_speed_samples = []
     tracking_error_samples = []
     orientation_error_samples = []
+    tracking_lin_reward_samples = []
+    tracking_ang_reward_samples = []
     reset_count = 0
 
     total_steps = warmup_steps + evaluation_steps
@@ -397,6 +400,24 @@ def evaluate(args, options):
             tracking_error_samples.append(
                 np.abs(speeds - options["eval_command_x"])
             )
+            tracking_lin_reward_samples.append(
+                (
+                    env._reward_tracking_lin_vel()
+                    * env.reward_scales["tracking_lin_vel"]
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            tracking_ang_reward_samples.append(
+                (
+                    env._reward_tracking_ang_vel()
+                    * env.reward_scales["tracking_ang_vel"]
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
             orientation_error_samples.append(
                 torch.norm(env.projected_gravity[:, :2], dim=1)
                 .detach().cpu().numpy()
@@ -414,6 +435,8 @@ def evaluate(args, options):
     speed_values = _pack(base_speed_samples)
     tracking_values = _pack(tracking_error_samples)
     orientation_values = _pack(orientation_error_samples)
+    tracking_lin_rewards = _pack(tracking_lin_reward_samples)
+    tracking_ang_rewards = _pack(tracking_ang_reward_samples)
 
     scenario = options["eval_scenario"]
     stair_step_height = (
@@ -422,7 +445,7 @@ def evaluate(args, options):
     sample_rate_hz = int(round(1.0 / float(env.sim_params.dt)))
     summary.update(
         {
-            "task": "quiet_mc",
+            "task": "quiet_mc_100hz",
             "robot": "mc",
             "baseline": "MC_HIM_fixed_pd_original_reward",
             "checkpoint_path": checkpoint_path,
@@ -433,6 +456,8 @@ def evaluate(args, options):
             "command_x_mps": float(options["eval_command_x"]),
             "mean_actual_base_speed_x_mps": float(np.mean(speed_values)) if speed_values.size else 0.0,
             "mean_abs_tracking_error_x_mps": float(np.mean(tracking_values)) if tracking_values.size else 0.0,
+            "mean_tracking_lin_reward": float(np.mean(tracking_lin_rewards)) if tracking_lin_rewards.size else 0.0,
+            "mean_tracking_ang_reward": float(np.mean(tracking_ang_rewards)) if tracking_ang_rewards.size else 0.0,
             "mean_orientation_error": float(np.mean(orientation_values)) if orientation_values.size else 0.0,
             "reset_count": int(reset_count),
             "resets_per_robot_second": float(reset_count) / max(

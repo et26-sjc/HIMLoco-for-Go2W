@@ -1,4 +1,4 @@
-"""Learned, sensorless per-leg admittance controller for the MC robot.
+"""Learned, sensorless per-leg impact-aware admittance for the MC robot.
 
 This module deliberately contains no simulator contact-force reads. It accepts
 only the contact state predicted by the policy-side estimator plus the four RL
@@ -7,14 +7,15 @@ MuJoCo and on hardware without a force sensor.
 
 Per leg, the virtual dynamics are
 
-    M x_ddot + D(beta) x_dot + K(beta) x = beta * g(dF) * F_transient
+    M x_ddot + D(beta) x_dot + K(beta) x
+        = beta * (1 + impact_gain * p_impact) * F_transient
 
-where ``alpha`` is the extra RL compliance action in [0, 1] and ``beta`` is a
-concave, zero-preserving authority mapping of alpha. ``F_transient`` is computed
-from the *estimated* contact force after subtracting a slow support-force
-baseline, and ``g(dF)`` is a smooth loading-rate gate. The resulting axial leg
-compression is mapped to HIP/KNEE target offsets through a damped least-squares
-Jacobian.
+where ``alpha`` is the extra RL compliance action in [0, 1], ``beta`` is a
+concave, zero-preserving authority mapping of alpha, and ``p_impact`` is the
+sensorless classifier probability. ``F_transient`` is computed from estimated
+contact force after subtracting a slow support-force baseline. The resulting
+axial leg compression is mapped to HIP/KNEE target offsets through a damped
+least-squares Jacobian.
 """
 
 import math
@@ -40,9 +41,29 @@ class MCLearnedAdmittance:
         self.force_bias_tau = float(cfg.force_bias_time_constant_s)
         self.force_deadband = float(cfg.force_deadband_n)
         self.force_scale = float(cfg.contact_force_scale_n)
-        self.loading_rate_scale = float(cfg.contact_loading_rate_scale_nps)
-        self.loading_rate_threshold = float(cfg.loading_rate_gate_nps)
-        self.loading_rate_softness = float(cfg.loading_rate_gate_softness_nps)
+        self.impact_gain = float(cfg.impact_gain)
+        self.impact_probability_pos_weight_correction = float(
+            cfg.impact_probability_pos_weight_correction
+        )
+        if (
+            not math.isfinite(self.impact_probability_pos_weight_correction)
+            or self.impact_probability_pos_weight_correction <= 0.0
+        ):
+            raise ValueError(
+                "impact_probability_pos_weight_correction must be positive"
+            )
+        self.impact_pos_weight_log_correction = math.log(
+            self.impact_probability_pos_weight_correction
+        )
+        self.impact_logit_correction_scale = float(
+            getattr(cfg, "impact_logit_correction_scale", 1.0)
+        )
+        if not math.isfinite(self.impact_logit_correction_scale):
+            raise ValueError("impact_logit_correction_scale must be finite")
+        self.impact_logit_correction = (
+            self.impact_logit_correction_scale
+            * self.impact_pos_weight_log_correction
+        )
 
         self.max_force_input = float(cfg.max_force_input_n)
         self.max_compression = float(cfg.max_compression_m)
@@ -60,13 +81,13 @@ class MCLearnedAdmittance:
         self.alpha = torch.zeros_like(self.delta_l)
         self.effective_alpha = torch.zeros_like(self.delta_l)
         self.estimated_force = torch.zeros_like(self.delta_l)
-        self.estimated_loading_rate = torch.zeros_like(self.delta_l)
+        self.impact_logits = torch.zeros_like(self.delta_l)
+        self.impact_probability = torch.zeros_like(self.delta_l)
         self.transient_force = torch.zeros_like(self.delta_l)
 
         # Diagnostic-only mirrors of intermediate controller variables. They do
         # not enter state() and therefore do not change the deployed information
         # flow or the policy observation dimensionality.
-        self.loading_gate = torch.zeros_like(self.delta_l)
         self.drive_force = torch.zeros_like(self.delta_l)
         self.stiffness = torch.full_like(self.delta_l, self.k_max)
         self.last_joint_offsets = torch.zeros(
@@ -82,9 +103,9 @@ class MCLearnedAdmittance:
         self.alpha[env_ids] = 0.0
         self.effective_alpha[env_ids] = 0.0
         self.estimated_force[env_ids] = 0.0
-        self.estimated_loading_rate[env_ids] = 0.0
+        self.impact_logits[env_ids] = 0.0
+        self.impact_probability[env_ids] = 0.0
         self.transient_force[env_ids] = 0.0
-        self.loading_gate[env_ids] = 0.0
         self.drive_force[env_ids] = 0.0
         self.stiffness[env_ids] = self.k_max
         self.last_joint_offsets[env_ids] = 0.0
@@ -114,24 +135,20 @@ class MCLearnedAdmittance:
             (compression, compression_vel, self.alpha, force_bias), dim=-1
         )
 
+    def impact_probability_from_logits(self, impact_logits):
+        """Calibrate weighted-BCE logits for probability-based control."""
+        return torch.sigmoid(impact_logits - self.impact_logit_correction)
+
     def _decode_contact_estimate(self, estimated_contact):
         if estimated_contact.shape[-1] != 8:
             raise RuntimeError(
-                f"Expected 8-D contact estimate [F(4), dF(4)], got "
+                f"Expected 8-D contact estimate [F(4), impact_logits(4)], got "
                 f"{tuple(estimated_contact.shape)}"
             )
         force = torch.clamp(estimated_contact[:, :4], min=0.0) * self.force_scale
-        loading = (
-            torch.clamp(estimated_contact[:, 4:8], min=0.0)
-            * self.loading_rate_scale
-        )
-        return force, loading
-
-    def _loading_gate(self, loading_rate):
-        softness = max(self.loading_rate_softness, 1.0)
-        return torch.sigmoid(
-            (loading_rate - self.loading_rate_threshold) / softness
-        )
+        impact_logits = estimated_contact[:, 4:8]
+        impact_probability = self.impact_probability_from_logits(impact_logits)
+        return force, impact_logits, impact_probability
 
     def _effective_compliance(self, alpha):
         """Map raw RL intent to physical authority without changing endpoints.
@@ -197,12 +214,13 @@ class MCLearnedAdmittance:
 
         alpha = torch.clamp(compliance_action, 0.0, 1.0)
         beta = self._effective_compliance(alpha)
-        force, loading_rate = self._decode_contact_estimate(estimated_contact)
+        force, impact_logits, impact_probability = self._decode_contact_estimate(
+            estimated_contact
+        )
 
-        gate = self._loading_gate(loading_rate)
         bias_alpha = float(dt) / max(float(dt) + self.force_bias_tau, 1.0e-6)
         bias_update = bias_alpha * (force - self.force_bias)
-        self.force_bias += (1.0 - gate) * bias_update
+        self.force_bias += (1.0 - impact_probability) * bias_update
 
         transient = torch.clamp(
             force - self.force_bias - self.force_deadband,
@@ -216,7 +234,7 @@ class MCLearnedAdmittance:
             torch.clamp(self.mass * stiffness, min=1.0e-6)
         )
 
-        drive = beta * gate * transient
+        drive = beta * (1.0 + self.impact_gain * impact_probability) * transient
         delta_l_ddot = (
             drive - damping * self.delta_l_dot - stiffness * self.delta_l
         ) / self.mass
@@ -246,9 +264,9 @@ class MCLearnedAdmittance:
         self.alpha.copy_(alpha)
         self.effective_alpha.copy_(beta)
         self.estimated_force.copy_(force)
-        self.estimated_loading_rate.copy_(loading_rate)
+        self.impact_logits.copy_(impact_logits)
+        self.impact_probability.copy_(impact_probability)
         self.transient_force.copy_(transient)
-        self.loading_gate.copy_(gate)
         self.drive_force.copy_(drive)
         self.stiffness.copy_(stiffness)
         self.last_joint_offsets.copy_(offsets)
