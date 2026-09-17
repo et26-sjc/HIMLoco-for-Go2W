@@ -26,8 +26,8 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
         # Inference-only calibration for logits learned with weighted BCE. This
         # must match policy.contact_estimator_impact_pos_weight.
         impact_probability_pos_weight_correction = 3.0
-        # Ablation knob: p_control = sigmoid(logit - scale * log(pos_weight)).
-        # It changes only the classifier-to-control mapping, not estimator loss.
+        # Frozen mapping selected by the classifier-to-control ablation:
+        # p_control = sigmoid(logit - scale * log(pos_weight)).
         impact_logit_correction_scale = 0.10
 
         virtual_mass_kg = 1.9
@@ -41,7 +41,6 @@ class MCLearnedAdmittance100HzCfg(MC100HzCfg):
         # baseline behaviour:
         #     beta = 1 - exp(-gain * alpha)
         compliance_activation_gain = 6.0
-
         force_bias_time_constant_s = 0.10
         force_deadband_n = 10.0
         max_force_input_n = 250.0
@@ -82,15 +81,15 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         # Fixed default. LR stability ablations override only this config value;
         # the ContactEstimator architecture and update path remain unchanged.
         contact_estimator_lr = 1.0e-3
-        # Stage-specific LR defaults reproduce the legacy single-LR behavior.
-        # They only change the existing ContactEstimator Adam learning rate.
+        # Frozen stage-specific rates: fast Stage-0 fitting, conservative
+        # Stage-1 adaptation.
         contact_estimator_warmup_lr = 1.0e-3
-        contact_estimator_online_lr = 1.0e-3
+        contact_estimator_online_lr = 3.0e-4
         contact_estimator_loss_force = 1.0
         contact_estimator_loss_impact = 1.0
         contact_estimator_impact_pos_weight = 3.0
-        # Replay samples per online sample; zero preserves legacy behavior.
-        contact_estimator_replay_ratio = 0.0
+        # Frozen Stage-0 replay mix, validated over 500 iterations and two seeds.
+        contact_estimator_replay_ratio = 0.25
         contact_estimator_replay_buffer_size = 8192
         motion_adapter_scale = 0.0
         # 0.05 was too conservative: after clipping negative samples to zero the
@@ -113,17 +112,22 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
         algorithm_class_name = "AdaptiveHIMPPO"
         runner_class_name = "AdaptiveHIMOnPolicyRunner"
         experiment_name = "MC_ImpactClassifier_Admittance_100Hz"
-        run_name = "impact_classifier_admittance_v1"
+        run_name = "replay_stabilized_impact_admittance"
 
         init_experiment_name = "MC_100Hz"
-        init_load_run = -1
-        init_checkpoint = -1
+        init_load_run = "Aug08_18-20-03_baseline"
+        init_checkpoint = 9000
+
+        max_iterations = 500
+        save_interval = 20
 
         contact_pretrain_steps = 500
         contact_pretrain_log_interval = 50
         contact_validation_steps = 200
         contact_validation_interval = 20
         contact_validation_batch_size = 8192
+        # Match the 256-env validation-set size when scaling training to 1024.
+        contact_validation_max_samples = 51200
         contact_validation_path = ""
         contact_replay_path = ""
 
@@ -139,6 +143,8 @@ class MCLearnedAdmittance100HzCfgPPO(MC100HzCfgPPO):
             "stage0-contact-warmup",
             "stage1-frozen-locomotion",
             "stage1-compliance-only",
+            "stage0-replay-0.25",
+            "estimator-online-lr-3e-4",
             "compliance-std-0.15",
             "effective-alpha-gain-6",
             "impact-trigger",

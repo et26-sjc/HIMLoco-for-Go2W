@@ -32,7 +32,7 @@ import torch
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs import *  # noqa: F401,F403; registers quiet_mc
 from legged_gym.utils import get_args, task_registry
-from legged_gym.utils.helpers import get_load_path
+from legged_gym.utils.helpers import get_load_path, set_seed
 
 
 DEFAULT_EVAL_SECONDS = 20.0
@@ -51,6 +51,10 @@ def _extract_custom_args():
         "warmup_seconds": (float, DEFAULT_WARMUP_SECONDS),
         "eval_command_x": (float, DEFAULT_COMMAND_X),
         "stair_difficulty": (float, DEFAULT_STAIR_DIFFICULTY),
+        "eval_seed": (int, 1),
+        "eval_zero_compliance": (int, 0),
+        "counterfactual_mode": (str, "none"),
+        "counterfactual_window_ms": (float, 50.0),
     }
     values = {name: default for name, (_, default) in specs.items()}
 
@@ -83,6 +87,23 @@ def _extract_custom_args():
     values["stair_difficulty"] = float(
         np.clip(values["stair_difficulty"], 0.0, 0.9)
     )
+    if values["counterfactual_mode"] == "none":
+        values["counterfactual_mode"] = None
+    if values["counterfactual_mode"] not in (
+        None,
+        "transient",
+        "residual",
+        "compression_velocity_reset",
+        "compression_state_reset",
+        "compression_state_clamp",
+    ):
+        raise ValueError(
+            "--counterfactual_mode must be none, transient, residual, "
+            "compression_velocity_reset, compression_state_reset, or "
+            "compression_state_clamp"
+        )
+    if values["counterfactual_window_ms"] <= 0.0:
+        raise ValueError("--counterfactual_window_ms must be positive")
     return values
 
 
@@ -174,6 +195,15 @@ def _set_fixed_commands(env, command_x):
         env.commands[:, 3] = 0.0
 
 
+def _synchronize_observation_history(env):
+    """Replace construction-time history with the paired post-reset state."""
+    env.compute_observations()
+    one_step = int(env.num_one_step_obs)
+    history_steps = int(env.obs_buf.shape[1] // one_step)
+    current = env.obs_buf[:, :one_step].clone()
+    env.obs_buf.copy_(current.repeat(1, history_steps))
+
+
 def _append_traces(store, env):
     mapping = {
         "force_z_n": env.quiet_trace_force_z,
@@ -181,6 +211,9 @@ def _append_traces(store, env):
         "loading_rate_z_nps": env.quiet_trace_loading_rate_z,
         "loading_rate_norm_nps": env.quiet_trace_loading_rate_norm,
         "wheel_vel_z_mps": env.quiet_trace_wheel_vel_z,
+        "wheel_pos_z_world_m": env.quiet_trace_wheel_pos_z_world,
+        "wheel_pos_z_base_m": env.quiet_trace_wheel_pos_z_base,
+        "leg_length_m": env.quiet_trace_leg_length,
         "wheel_lateral_speed_mps": env.quiet_trace_wheel_lateral_speed,
         "wheel_omega_radps": env.quiet_trace_wheel_omega,
         "wheel_alpha_radps2": env.quiet_trace_wheel_alpha,
@@ -189,6 +222,12 @@ def _append_traces(store, env):
         "base_acc_z_mps2": env.quiet_trace_base_acc_z,
         "base_jerk_z_mps3": env.quiet_trace_base_jerk_z,
         "max_torque_rate_nmps": env.quiet_trace_max_torque_rate,
+        # Policy-rate equivalence traces, saved only in evaluation artifacts.
+        "motion_action": env.actions,
+        "torque": env.torques,
+        "dof_pos": env.dof_pos,
+        "dof_vel": env.dof_vel,
+        "root_state": env.root_states,
     }
     for key, tensor in mapping.items():
         array = tensor.detach().cpu().numpy()
@@ -337,10 +376,15 @@ def evaluate(args, options):
     )
     policy = runner.get_inference_policy(device=env.device)
 
+    # Runner construction initializes different network sets for the baseline
+    # and adaptive policies. Re-seed immediately before the reset so paired
+    # evaluations receive identical randomized initial robot states.
+    set_seed(options["eval_seed"])
     terrain_level, actual_difficulty = _place_on_fixed_terrain(
         env, options["eval_scenario"], options["stair_difficulty"]
     )
     _set_fixed_commands(env, options["eval_command_x"])
+    _synchronize_observation_history(env)
     observations = env.get_observations()
 
     warmup_steps = int(options["warmup_seconds"] / env.dt)
@@ -352,6 +396,9 @@ def evaluate(args, options):
         "loading_rate_z_nps",
         "loading_rate_norm_nps",
         "wheel_vel_z_mps",
+        "wheel_pos_z_world_m",
+        "wheel_pos_z_base_m",
+        "leg_length_m",
         "wheel_lateral_speed_mps",
         "wheel_omega_radps",
         "wheel_alpha_radps2",
@@ -360,6 +407,11 @@ def evaluate(args, options):
         "base_acc_z_mps2",
         "base_jerk_z_mps3",
         "max_torque_rate_nmps",
+        "motion_action",
+        "torque",
+        "dof_pos",
+        "dof_vel",
+        "root_state",
     ]
     traces = {key: [] for key in trace_keys}
     event_keys = [
@@ -453,6 +505,7 @@ def evaluate(args, options):
             "evaluation_seconds": float(options["eval_seconds"]),
             "warmup_seconds": float(options["warmup_seconds"]),
             "num_envs": int(env.num_envs),
+            "eval_seed": int(options["eval_seed"]),
             "command_x_mps": float(options["eval_command_x"]),
             "mean_actual_base_speed_x_mps": float(np.mean(speed_values)) if speed_values.size else 0.0,
             "mean_abs_tracking_error_x_mps": float(np.mean(tracking_values)) if tracking_values.size else 0.0,

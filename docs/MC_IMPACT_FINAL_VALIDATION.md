@@ -1,5 +1,12 @@
 # MC Impact-aware Admittance Final Validation
 
+> Follow-up note: the later strictly paired multi-seed descent evaluation in
+> [MC_QUIET_PAIRED_DESCENT_VALIDATION.md](MC_QUIET_PAIRED_DESCENT_VALIDATION.md)
+> supersedes the single-run quiet interpretation below. It confirms lower
+> typical force/loading peaks, but also finds higher touchdown frequency and
+> base vibration. The resulting quiet verdict remains `PARTIAL`, and a
+> 4096-environment final run is not yet justified.
+
 ## Scope
 
 This validation uses the fixed recommended configuration: `pos_weight=3`,

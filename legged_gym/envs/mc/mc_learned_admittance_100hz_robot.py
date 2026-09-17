@@ -111,6 +111,17 @@ class MCLearnedAdmittance100Hz(MC):
         )
 
         self.gt_step_peak_base_acc = torch.zeros(self.num_envs, device=self.device)
+        # Privileged reward/diagnostics only. Match the quiet evaluator's
+        # 5 N contact-on / 2 N contact-off wheel-event definition at 200 Hz.
+        self.gt_short_contact_state = (
+            torch.norm(self.contact_forces[:, self.adm_feet_indices, :], dim=-1)
+            >= 5.0
+        )
+        self.gt_short_release_age = torch.zeros(
+            shape, device=self.device, dtype=torch.long
+        )
+        self.gt_step_short_recontact = torch.zeros(shape, device=self.device)
+        self.gt_step_touchdown = torch.zeros(shape, device=self.device)
         self.gt_prev_base_vel_z = self._base_vel_z().clone()
         self.contact_estimator_target = torch.zeros(
             self.num_envs, self.contact_estimate_dim, device=self.device
@@ -466,6 +477,12 @@ class MCLearnedAdmittance100Hz(MC):
             "Impact/gt_base_acc_peak_max_mps2": torch.max(
                 self.gt_step_peak_base_acc
             ),
+            "Impact/gt_short_recontact_per_env_step": torch.mean(
+                torch.sum(self.gt_step_short_recontact, dim=1)
+            ),
+            "Impact/gt_touchdown_per_env_step": torch.mean(
+                torch.sum(self.gt_step_touchdown, dim=1)
+            ),
         }
 
         # Diagnostic-only distribution of the unchanged 5000 N/s hard label.
@@ -505,6 +522,32 @@ class MCLearnedAdmittance100Hz(MC):
         self.gt_step_peak_axial_force.zero_()
         self.gt_step_peak_axial_loading_rate.zero_()
         self.gt_step_peak_base_acc.zero_()
+        self.gt_step_short_recontact.zero_()
+        self.gt_step_touchdown.zero_()
+
+    def _update_gt_short_recontact_substep(self, force_norm):
+        """Count only re-contact within 20 ms of a previous GT release."""
+        previous = self.gt_short_contact_state
+        contacting = torch.where(previous, force_norm > 2.0, force_norm >= 5.0)
+        release = previous & ~contacting
+        touchdown = ~previous & contacting
+        max_age = max(1, int(round(0.020 / float(self.sim_params.dt))))
+        self.gt_step_short_recontact.add_(
+            (touchdown & (self.gt_short_release_age >= 1)
+             & (self.gt_short_release_age <= max_age)).float()
+        )
+        self.gt_step_touchdown.add_(touchdown.float())
+        self.gt_short_release_age = torch.where(
+            contacting, torch.zeros_like(self.gt_short_release_age),
+            torch.where(release, torch.ones_like(self.gt_short_release_age),
+                        torch.where(
+                            self.gt_short_release_age > 0,
+                            torch.clamp(self.gt_short_release_age + 1,
+                                        max=max_age + 1),
+                            torch.zeros_like(self.gt_short_release_age),
+                        )),
+        )
+        self.gt_short_contact_state.copy_(contacting)
 
     def _ground_truth_contact_signals(self):
         force_vec = self.contact_forces[:, self.adm_feet_indices, :]
@@ -525,6 +568,7 @@ class MCLearnedAdmittance100Hz(MC):
     def _update_gt_impact_substep(self):
         physics_dt = float(self.sim_params.dt)
         force_norm, axial_force = self._ground_truth_contact_signals()
+        self._update_gt_short_recontact_substep(force_norm)
 
         loading_rate = torch.clamp(
             (force_norm - self.gt_prev_force_norm) / physics_dt, min=0.0
@@ -600,29 +644,47 @@ class MCLearnedAdmittance100Hz(MC):
         actions_scaled = actions_scaled.clone()
         actions_scaled[:, self.wheel_indices] = 0.0
 
-        q_target = self.default_dof_pos + actions_scaled
+        q_nominal = self.default_dof_pos + actions_scaled
         offsets = self.admittance.step(
             compliance_actions,
             estimated_contact,
-            q_target,
+            q_nominal,
             self.adm_hip_indices,
             self.adm_knee_indices,
             float(self.sim_params.dt),
         )
-        q_target[:, self.adm_hip_indices] += offsets[:, :, 0]
-        q_target[:, self.adm_knee_indices] += offsets[:, :, 1]
-
-        for indices in (self.adm_hip_indices, self.adm_knee_indices):
-            q_target[:, indices] = torch.maximum(
-                torch.minimum(
-                    q_target[:, indices],
-                    self.dof_pos_limits[indices, 1].unsqueeze(0),
-                ),
-                self.dof_pos_limits[indices, 0].unsqueeze(0),
+        q_target = q_nominal.clone()
+        for indices, residual in (
+            (self.adm_hip_indices, offsets[:, :, 0]),
+            (self.adm_knee_indices, offsets[:, :, 1]),
+        ):
+            nominal = q_nominal[:, indices]
+            lower = self.dof_pos_limits[indices, 0].unsqueeze(0)
+            upper = self.dof_pos_limits[indices, 1].unsqueeze(0)
+            # Limit only the compliance residual. If HIMLoco's nominal target
+            # is already outside a URDF limit, zero residual must still exactly
+            # reproduce baseline PD; nonzero residual may only keep or reduce
+            # that nominal violation, never make it worse.
+            residual_lower = torch.where(
+                nominal < lower, torch.zeros_like(nominal), lower - nominal
             )
+            residual_upper = torch.where(
+                nominal > upper, torch.zeros_like(nominal), upper - nominal
+            )
+            safe_residual = torch.maximum(
+                torch.minimum(residual, residual_upper), residual_lower
+            )
+            q_target[:, indices] = nominal + safe_residual
 
-        pos_err = q_target - self.dof_pos
-        pos_err[:, self.wheel_indices] = 0.0
+        # Preserve the baseline expression and operation order bit-for-bit,
+        # then add only the bounded compliance contribution. This matters in a
+        # chaotic contact rollout: the algebraically equivalent
+        # (default + action) - q form accumulates a different rounding history.
+        dof_err = self.default_dof_pos - self.dof_pos
+        dof_err[:, self.wheel_indices] = 0.0
+        pos_err = actions_scaled + dof_err
+        for indices in (self.adm_hip_indices, self.adm_knee_indices):
+            pos_err[:, indices] += q_target[:, indices] - q_nominal[:, indices]
         vel_ref = torch.zeros_like(actions_scaled)
         vel_tmp = motion_actions * self.cfg.control.vel_scale
         vel_ref[:, self.wheel_indices] = vel_tmp[:, self.wheel_indices]
@@ -735,6 +797,10 @@ class MCLearnedAdmittance100Hz(MC):
         self.gt_prev_axial_force[env_ids] = 0.0
         self.gt_skip_rate_once[env_ids] = True
         self.gt_step_peak_base_acc[env_ids] = 0.0
+        self.gt_short_contact_state[env_ids] = False
+        self.gt_short_release_age[env_ids] = 0
+        self.gt_step_short_recontact[env_ids] = 0.0
+        self.gt_step_touchdown[env_ids] = 0.0
         self.contact_estimator_target[env_ids] = 0.0
         # The observation returned for a terminated environment is already the
         # reset state, so it must not be paired with the terminal impact label.

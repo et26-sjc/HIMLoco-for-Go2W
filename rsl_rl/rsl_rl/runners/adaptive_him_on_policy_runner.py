@@ -337,6 +337,13 @@ class AdaptiveHIMOnPolicyRunner:
         num_steps = int(self.cfg.get("contact_validation_steps", 0))
         if num_steps <= 0:
             return obs, controller_state, critic_obs
+        max_samples = max(
+            1, int(self.cfg.get("contact_validation_max_samples", 51200))
+        )
+        samples_per_step = min(
+            self.env.num_envs,
+            max(1, math.ceil(max_samples / num_steps)),
+        )
 
         print(
             f"[contact validation] collecting {num_steps} deterministic "
@@ -353,23 +360,34 @@ class AdaptiveHIMOnPolicyRunner:
         }
 
         with torch.inference_mode():
-            for _ in range(num_steps):
+            for step in range(num_steps):
                 # The current post-step observation and controller state are
                 # paired with the target/loading rate from that same completed
                 # transition. GT values are copied only into this CPU dataset.
-                samples["obs_history"].append(obs.detach().cpu())
+                # Deterministic subsampling keeps fixed-validation memory and
+                # cost independent of the training environment count.
+                stride = max(1, self.env.num_envs // samples_per_step)
+                sample_ids = (
+                    torch.arange(samples_per_step, device=self.device) * stride
+                    + step
+                ) % self.env.num_envs
+                samples["obs_history"].append(
+                    obs[sample_ids].detach().cpu()
+                )
                 samples["controller_state"].append(
-                    controller_state.detach().cpu()
+                    controller_state[sample_ids].detach().cpu()
                 )
                 samples["contact_target"].append(
-                    self.env.get_contact_estimator_target().detach().cpu()
+                    self.env.get_contact_estimator_target()[sample_ids]
+                    .detach().cpu()
                 )
                 samples["axial_loading_rate_nps"].append(
-                    self.env.get_contact_validation_loading_rate().detach().cpu()
+                    self.env.get_contact_validation_loading_rate()[sample_ids]
+                    .detach().cpu()
                 )
                 if hasattr(self.env, "commands"):
                     samples["commands"].append(
-                        self.env.commands.detach().cpu()
+                        self.env.commands[sample_ids].detach().cpu()
                     )
 
                 actions = self.actor_critic.act_inference(
@@ -397,10 +415,11 @@ class AdaptiveHIMOnPolicyRunner:
         candidate = {}
         for key, chunks in samples.items():
             if chunks:
-                candidate[key] = torch.cat(chunks, dim=0)
+                candidate[key] = torch.cat(chunks, dim=0)[:max_samples]
         candidate["metadata"] = {
             "num_envs": int(self.env.num_envs),
             "num_steps": num_steps,
+            "sample_count": int(candidate["obs_history"].shape[0]),
             "baseline_compliance": 0.0,
         }
 
@@ -653,7 +672,10 @@ class AdaptiveHIMOnPolicyRunner:
                 self.writer.add_scalar(key, value, iteration)
             self.writer.flush()
         if self.wandb_run is not None:
-            self.wandb_run.log(metrics, step=iteration)
+            # The training log for this same 1-based iteration commits the
+            # combined W&B row. This avoids out-of-order validation/training
+            # steps, including immediately after resume.
+            self.wandb_run.log(metrics, step=iteration, commit=False)
         print(
             f"[contact validation] iter={iteration} "
             f"raw_f1={metrics['Validation/raw_f1']:.4f} "
@@ -817,7 +839,7 @@ class AdaptiveHIMOnPolicyRunner:
 
             if self.log_dir is not None:
                 self.log(
-                    it,
+                    self.current_learning_iteration,
                     losses,
                     collection_time,
                     learn_time,
@@ -914,9 +936,10 @@ class AdaptiveHIMOnPolicyRunner:
             metrics["Perf/learning_time"] = learn_time
             self.wandb_run.log(metrics, step=it)
 
+        mean_reward = metrics.get("Train/mean_reward")
+        reward_text = "n/a" if mean_reward is None else f"{mean_reward:.3f}"
         print(
-            f"[adaptive] iter={it} reward="
-            f"{metrics.get('Train/mean_reward', float('nan')):.3f} "
+            f"[adaptive] iter={it} reward={reward_text} "
             f"contact_F={losses['contact_force']:.4f} "
             f"contact_impact={losses['contact_impact']:.4f} "
             f"alpha={metrics.get('Admittance/alpha_mean', float('nan')):.3f} "
@@ -926,6 +949,17 @@ class AdaptiveHIMOnPolicyRunner:
         )
 
     def save(self, path, infos=None):
+        estimator = self.actor_critic.contact_estimator
+        contact_replay = None
+        if estimator.replay_target is not None:
+            contact_replay = {
+                "obs_history": estimator.replay_obs_history.detach().cpu(),
+                "controller_state": (
+                    estimator.replay_controller_state.detach().cpu()
+                ),
+                "contact_target": estimator.replay_target.detach().cpu(),
+                "cursor": int(estimator.replay_cursor),
+            }
         torch.save(
             {
                 "model_state_dict": self.actor_critic.state_dict(),
@@ -940,6 +974,9 @@ class AdaptiveHIMOnPolicyRunner:
                 "tot_timesteps": self.tot_timesteps,
                 "tot_time": self.tot_time,
                 "contact_warmup_done": self.contact_warmup_done,
+                # Replay is part of the learned estimator state. Keeping it in
+                # the checkpoint makes adaptive resume self-contained.
+                "contact_replay": contact_replay,
                 "infos": infos,
             },
             path,
@@ -963,6 +1000,18 @@ class AdaptiveHIMOnPolicyRunner:
                 self.actor_critic.contact_estimator.optimizer.load_state_dict(
                     loaded["contact_estimator_optimizer_state_dict"]
                 )
+            replay = loaded.get("contact_replay")
+            if replay is not None:
+                estimator = self.actor_critic.contact_estimator
+                estimator.set_replay_buffer(
+                    replay["obs_history"],
+                    replay["controller_state"],
+                    replay["contact_target"],
+                )
+                if estimator.replay_target is not None:
+                    estimator.replay_cursor = int(
+                        replay.get("cursor", 0)
+                    ) % estimator.replay_target.shape[0]
         else:
             current = self.actor_critic.state_dict()
             copied = []

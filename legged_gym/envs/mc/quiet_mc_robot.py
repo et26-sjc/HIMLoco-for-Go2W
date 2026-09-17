@@ -47,6 +47,15 @@ class QuietMC(MC):
         wheel_rel_pos_body = self._to_base_frame(relative_pos_world)
         return wheel_vel_world, wheel_vel_body, wheel_rel_pos_body[:, :, 2]
 
+    def _wheel_geometry(self):
+        """Return passive wheel-center geometry for evaluation traces."""
+        states = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)
+        wheel_pos_world = states[:, self.feet_indices, 0:3]
+        relative_pos_world = wheel_pos_world - self.root_states[:, None, 0:3]
+        wheel_rel_pos_body = self._to_base_frame(relative_pos_world)
+        leg_length = torch.norm(wheel_rel_pos_body, dim=-1)
+        return wheel_pos_world[:, :, 2], wheel_rel_pos_body[:, :, 2], leg_length
+
     def _base_vel_z(self):
         return quat_rotate_inverse(
             self.root_states[:, 3:7], self.root_states[:, 7:10]
@@ -158,6 +167,15 @@ class QuietMC(MC):
         self.quiet_trace_loading_rate_z = torch.zeros(wheel_trace_shape, device=self.device)
         self.quiet_trace_loading_rate_norm = torch.zeros(wheel_trace_shape, device=self.device)
         self.quiet_trace_wheel_vel_z = torch.zeros(wheel_trace_shape, device=self.device)
+        self.quiet_trace_wheel_pos_z_world = torch.zeros(
+            wheel_trace_shape, device=self.device
+        )
+        self.quiet_trace_wheel_pos_z_base = torch.zeros(
+            wheel_trace_shape, device=self.device
+        )
+        self.quiet_trace_leg_length = torch.zeros(
+            wheel_trace_shape, device=self.device
+        )
         self.quiet_trace_wheel_lateral_speed = torch.zeros(wheel_trace_shape, device=self.device)
         self.quiet_trace_wheel_omega = torch.zeros(wheel_trace_shape, device=self.device)
         self.quiet_trace_wheel_alpha = torch.zeros(wheel_trace_shape, device=self.device)
@@ -261,6 +279,7 @@ class QuietMC(MC):
     def _update_quiet_metrics_substep(self, substep):
         physics_dt = float(self.sim_params.dt)
         wheel_vel_world, wheel_vel_body, wheel_rel_z = self._wheel_kinematics()
+        wheel_pos_z_world, wheel_pos_z_base, leg_length = self._wheel_geometry()
         force_vec = self.contact_forces[:, self.feet_indices, :]
         force_z = torch.clamp(force_vec[:, :, 2], min=0.0)
         force_norm = torch.norm(force_vec, dim=-1)
@@ -440,6 +459,9 @@ class QuietMC(MC):
         self.quiet_trace_loading_rate_z[substep].copy_(loading_rate_z)
         self.quiet_trace_loading_rate_norm[substep].copy_(loading_rate_norm)
         self.quiet_trace_wheel_vel_z[substep].copy_(wheel_vel_world[:, :, 2])
+        self.quiet_trace_wheel_pos_z_world[substep].copy_(wheel_pos_z_world)
+        self.quiet_trace_wheel_pos_z_base[substep].copy_(wheel_pos_z_base)
+        self.quiet_trace_leg_length[substep].copy_(leg_length)
         self.quiet_trace_wheel_lateral_speed[substep].copy_(
             torch.abs(wheel_vel_body[:, :, 1])
         )
